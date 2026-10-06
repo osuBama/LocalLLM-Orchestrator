@@ -1,0 +1,51 @@
+# Copy to <install>\evals\golden.yaml and write cases about YOUR work.
+# Each case replays a session (recorded or scripted), then asks one question with real
+# generation (temperature 0) and grades the answer:
+#   expect_all: every item must appear     expect_any: at least one must appear
+#   forbid:     none may appear            "/regex/" items are regular expressions
+# Strings match case-insensitively. Good cases ask about details from EARLY in a long
+# session (tests trimming + summaries), from old tool output (tests compression), or
+# facts that only live in long-term memory (tests injection).
+
+cases:
+  - name: port-from-early-turn
+    turns:
+      - user: "The memory Ollama instance listens on port 11435 and the primary on 11434."
+        assistant: "Noted: memory on 11435, primary on 11434."
+      - user: "Write me a haiku about GPUs."
+        assistant: "Silicon rivers / two cards hum in quiet sync / tokens fall like rain"
+      - user: "What's a good name for a homelab server?"
+        assistant: "How about 'forge'?"
+      - user: "Any tips for cable management?"
+        assistant: "Velcro straps and a labeled patch panel."
+      - user: "Recommend a lightweight Linux distro."
+        assistant: "Debian netinst or Alpine."
+    question: "Which port does the memory instance use? Answer with the number."
+    expect_all: ["11435"]
+    forbid: ["/\\b11434\\b.*memory/"]
+
+  - name: detail-in-old-tool-output
+    turns:
+      - user: "Check the service log."
+        tools:
+          - tool: read_log
+            arguments: {path: "service.log"}
+            result: |
+              2026-10-01 10:00:01 INFO starting worker pool size=4
+              2026-10-01 10:00:02 INFO listening on 0.0.0.0:9090
+              2026-10-01 10:00:07 ERROR db connection refused: host=db-02 port=5433
+              2026-10-01 10:00:08 INFO retrying in 5s
+        assistant: "The service can't reach the database on db-02:5433."
+      - user: "Unrelated: how do I list listening ports on Windows?"
+        assistant: "netstat -ano | findstr LISTENING"
+      - user: "And on Linux?"
+        assistant: "ss -tlnp"
+    question: "Which host and port was the database the service failed to reach?"
+    expect_all: ["db-02", "5433"]
+
+  # Replay a real recorded session (ids from `ai eval sessions`):
+  # - name: my-real-session
+  #   session: oc-0123456789abcd
+  #   upto_turn: 20
+  #   question: "Which route did we end up using for the MCP server?"
+  #   expect_any: ["/mcp"]

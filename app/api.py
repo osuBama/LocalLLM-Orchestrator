@@ -5,6 +5,7 @@ Binds to 127.0.0.1 by default. Do not expose to the LAN.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 
@@ -98,9 +99,15 @@ def create_app(config: Config | None = None, *,
     @app.get("/memory/context")
     async def memory_context(q: str = Query(..., min_length=1)):
         """Debug: exactly what would be injected for this prompt."""
-        ctx = orch.context_builder.build(q)
-        return {"token_estimate": ctx.token_estimate, "budget": config.memory.max_context_tokens,
-                "included": ctx.included, "dropped": ctx.dropped, "text": ctx.text}
+        base = orch.memory_base("__debug__", ("debug", q))
+        budget = config.memory.max_context_tokens - (base.tokens if base else 0)
+        ctx = orch.context_builder.build(q, max_tokens=budget, base=base)
+        return {"budget": config.memory.max_context_tokens,
+                "base": {"token_estimate": base.tokens if base else 0,
+                         "included": list(base.fingerprints) if base else [],
+                         "dropped": base.dropped if base else [], "text": base.text if base else ""},
+                "turn": {"token_estimate": ctx.token_estimate, "included": ctx.included,
+                         "dropped": ctx.dropped, "text": ctx.text}}
 
     @app.get("/memory/changes")
     async def memory_changes(limit: int = Query(50, ge=1, le=500)):
@@ -123,8 +130,22 @@ def create_app(config: Config | None = None, *,
         return {"backup": str(orch.manager.snapshot("manual"))}
 
     @app.post("/memory/consolidate")
-    async def memory_consolidate():
-        raise HTTPException(501, "Memory consolidation is Phase 4 and not implemented yet.")
+    async def memory_consolidate(dry_run: bool = False):
+        """Run consolidation now (waits for the memory GPU to be free)."""
+        async with orch.worker.lock:
+            report = await orch.consolidator.run(trigger="api", dry_run=dry_run, force=True)
+        return report.to_dict()
+
+    @app.get("/memory/consolidation")
+    async def memory_consolidation_status():
+        due, why = orch.consolidator.due()
+        last = orch.db.kv_get("consolidation.last_report")
+        return {"due": due, "reason": why, "last_report": json.loads(last) if last else None}
+
+    @app.get("/memory/review")
+    async def memory_review():
+        return {"stale_after_days": config.consolidation.stale_after_days,
+                "entries": orch.consolidator.review()}
 
     @app.get("/metrics")
     async def metrics():

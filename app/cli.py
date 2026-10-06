@@ -96,9 +96,16 @@ def cmd_memory(cfg, args) -> int:
                 flag = "" if h.entry.active else " (inactive)"
                 print(f"{h.score:6.2f}  [{h.entry.entry_id}] {h.entry.title}{flag}\n        {h.entry.content}")
         elif sub == "context":
-            ctx = orch.context_builder.build(args.query)
+            base = orch.memory_base("__cli__", ("cli",))
+            budget = cfg.memory.max_context_tokens - (base.tokens if base else 0)
+            ctx = orch.context_builder.build(args.query, max_tokens=budget, base=base)
+            if base and base.text:
+                print("== memory base (system prompt, cached) ==")
+                print(base.text)
+                print(f"-- ~{base.tokens} tokens; dropped (did not fit) {base.dropped}\n")
+            print("== per-turn block (with the user's message) ==")
             print(ctx.text or "(nothing relevant)")
-            print(f"\n-- ~{ctx.token_estimate} tokens / budget {cfg.memory.max_context_tokens}; "
+            print(f"\n-- ~{ctx.token_estimate} tokens; total budget {cfg.memory.max_context_tokens}; "
                   f"included {ctx.included}; dropped {ctx.dropped}")
         elif sub == "validate":
             report = orch.manager.validate_files()
@@ -126,11 +133,83 @@ def cmd_memory(cfg, args) -> int:
         elif sub == "tasks":
             _print({"counts": orch.db.task_counts(), "recent": orch.db.list_tasks(args.limit)})
         elif sub == "consolidate":
-            print("Memory consolidation is Phase 4 and not implemented yet.")
-            return 3
+            report = asyncio.run(orch.consolidator.run(trigger="cli", dry_run=args.dry_run, force=True))
+            for a in report.applied:
+                print(f"{'would apply' if report.dry_run else 'applied'}: {a['kind']:<7} {a['category']:<11} "
+                      f"{a['title']}  {a['changes']}")
+            for r in report.rejected:
+                print(f"rejected: {r.get('category', '?'):<11} {r['reason']}")
+            print(f"-- jobs {report.jobs}, proposals {report.proposals}, applied {len(report.applied)}, "
+                  f"rejected {len(report.rejected)}" + (f", backup {report.backup}" if report.backup else "")
+                  + (f", error {report.error}" if report.error else ""))
+        elif sub == "review":
+            rows = orch.consolidator.review()
+            if not rows:
+                print(f"Nothing unused for {cfg.consolidation.stale_after_days}+ days.")
+            for r in rows:
+                print(f"[{r['entry_id']}] {r['title']}  (created {r['created_at'][:10]}, "
+                      f"last used {(r['last_used_at'] or 'never')[:10]}, used {r['use_count']}x)")
+        elif sub == "restore":
+            _print(orch.manager.restore(args.backup_dir))
         return 0
     finally:
         asyncio.run(orch.aclose())
+
+
+def cmd_eval(cfg, args) -> int:
+    from pathlib import Path
+
+    from . import evaluation as ev
+    recorded = ev.load_recorded_sessions(cfg.conversations_dir)
+    if args.eval_cmd == "sessions":
+        if not recorded:
+            print(f"No recorded sessions in {cfg.conversations_dir}")
+        for sid, s in recorded.items():
+            tools = sum(len(t.tool_events) for t in s.turns) // 2
+            print(f"{sid:<40} {len(s.turns):>4} turns  {tools:>4} tool calls  "
+                  f"first: {s.turns[0].user[:50]!r}")
+        return 0
+
+    evals_dir = cfg.root_dir / "evals"
+    variants = ev.load_variants(Path(args.variants) if args.variants else evals_dir / "variants.yaml")
+    names = [v.strip() for v in args.variant.split(",") if v.strip()]
+    golden_path = Path(args.golden) if args.golden else evals_dir / "golden.yaml"
+    golden = ev.load_golden(golden_path) if golden_path.exists() and not args.no_golden else []
+
+    if args.sessions:
+        wanted = [x.strip() for x in args.sessions.split(",") if x.strip()]
+        missing = [w for w in wanted if w not in recorded]
+        if missing:
+            print(f"Unknown session(s): {', '.join(missing)} (see `ai eval sessions`)")
+            return 2
+        sessions = [recorded[w] for w in wanted]
+    else:
+        pool = [s for s in recorded.values() if len(s.turns) >= args.min_turns]
+        sessions = pool[-args.last:] if args.last else []
+    if not sessions and not golden:
+        print("Nothing to evaluate: no recorded sessions selected and no golden cases "
+              f"({golden_path}). See README §11.")
+        return 2
+
+    try:
+        httpx.get(_server(cfg) + "/health", timeout=1)
+        print("WARNING: the orchestrator server is running. Live traffic to the same Ollama instances "
+              "distorts cache and timing measurements; stop it for clean numbers.")
+    except httpx.HTTPError:
+        pass
+
+    client_system = Path(args.client_system).read_text(encoding="utf-8") if args.client_system \
+        else ev.DEFAULT_CLIENT_SYSTEM
+    print(f"Variants: {', '.join(names)} | sessions: {len(sessions)} | golden cases: {len(golden)}")
+    report = asyncio.run(ev.run_eval(
+        cfg, variants=variants, variant_names=names, sessions=sessions, golden=golden,
+        max_turns=args.max_turns, memory=args.memory, extract=args.extract,
+        think=None if args.think == "default" else args.think == "on", client_system=client_system,
+        max_answer_tokens=args.max_answer_tokens, seed=args.seed))
+    print()
+    print(Path(report["files"]["markdown"]).read_text(encoding="utf-8"))
+    print(f"Report: {report['files']['markdown']}\nJSON:   {report['files']['json']}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -166,7 +245,32 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--limit", type=int, default=5)
     s = msp.add_parser("tasks")
     s.add_argument("--limit", type=int, default=20)
-    msp.add_parser("consolidate")
+    s = msp.add_parser("consolidate", help="merge duplicates / tighten long entries now")
+    s.add_argument("--dry-run", action="store_true", help="show proposals without applying")
+    msp.add_parser("review", help="active entries unused for consolidation.stale_after_days")
+    s = msp.add_parser("restore", help="restore memory files from a backups\\... snapshot")
+    s.add_argument("backup_dir")
+
+    e = sp.add_parser("eval", help="evaluation harness (README §11)")
+    esp = e.add_subparsers(dest="eval_cmd", required=True)
+    esp.add_parser("sessions", help="list recorded sessions available for replay")
+    s = esp.add_parser("run", help="replay sessions / golden questions under config variants")
+    s.add_argument("--variant", default="baseline,full",
+                   help="comma-separated; first is the comparison baseline (default: baseline,full)")
+    s.add_argument("--variants", help="variants file (default: evals/variants.yaml)")
+    s.add_argument("--golden", help="golden questions file (default: evals/golden.yaml)")
+    s.add_argument("--no-golden", action="store_true")
+    s.add_argument("--sessions", help="comma-separated recorded session ids")
+    s.add_argument("--last", type=int, default=3, help="otherwise: the last N recorded sessions (default 3)")
+    s.add_argument("--min-turns", type=int, default=4, help="skip shorter sessions (default 4)")
+    s.add_argument("--max-turns", type=int, help="replay at most N turns per session")
+    s.add_argument("--memory", choices=["current", "empty"], default="current",
+                   help="start each variant from a copy of current memory, or from empty memory")
+    s.add_argument("--extract", action="store_true", help="also run memory extraction during replay")
+    s.add_argument("--think", choices=["off", "on", "default"], default="off")
+    s.add_argument("--client-system", help="file with your client's real system prompt (e.g. OpenClaw's)")
+    s.add_argument("--max-answer-tokens", type=int, default=512)
+    s.add_argument("--seed", type=int, default=42)
 
     args = p.parse_args(argv)
     cfg = load_config(args.config)
@@ -185,6 +289,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_http_get(cfg, "/metrics")
     if args.cmd == "memory":
         return cmd_memory(cfg, args)
+    if args.cmd == "eval":
+        return cmd_eval(cfg, args)
     return 1
 
 

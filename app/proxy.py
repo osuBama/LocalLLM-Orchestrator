@@ -35,7 +35,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from . import compression
-from .context_builder import BuiltContext, wrap_user_request
+from .context_builder import BuiltContext, StableSnapshot, wrap_user_request
 from .flags import FlagStripper
 from .metrics import Metrics
 from .ollama_client import OllamaError
@@ -206,6 +206,8 @@ class TurnPlan:
     flags: list[dict] = field(default_factory=list)
     boundary: int = 0                                   # tool results of turns <= this may be digests
     frozen: dict[str, str] = field(default_factory=dict)  # result hash -> digest
+    base: StableSnapshot | None = None                  # frozen memory base for the system prompt
+    est_size: int | None = None                         # size mode: estimated prompt tokens
 
 
 # ---------------------------------------------------------------- router
@@ -214,6 +216,7 @@ def build_router(orch: Orchestrator) -> APIRouter:
     cfg = orch.config
     plans: OrderedDict[tuple, TurnPlan] = OrderedDict()
     layouts: OrderedDict[tuple, dict[str, str]] = OrderedDict()
+    size_state: OrderedDict[str, tuple[int, int]] = OrderedDict()   # conversation -> (cut, boundary)
     never_tools = set(cfg.compression.never_compress_tools)
 
     def new_stripper() -> FlagStripper | None:
@@ -239,27 +242,106 @@ def build_router(orch: Orchestrator) -> APIRouter:
             layouts.popitem(last=False)
         return frozen
 
-    def plan_for(conversation_id: str, turn: int, user_text: str, original: list[dict]) -> TurnPlan:
+    def size_mode() -> bool:
+        return cfg.proxy.trim_mode == "size" and bool(cfg.ollama.primary.num_ctx)
+
+    def estimate_prompt(conversation_id: str, original: list[dict], tools_tokens: int,
+                        cut: int, boundary: int) -> int:
+        """Rough prompt size if history were cut at `cut` and compressed up to `boundary`.
+
+        Includes the system prompt we add, the client's tool schemas, a per-message
+        template allowance, and reserves for the memory block and the reply. Errs large:
+        an overflow is silent truncation, an underestimate of free room just costs a cut.
+        """
+        kept = drop_user_turns(original, cut)
+        if boundary and cfg.compression.enabled:
+            frozen = frozen_digests(conversation_id, cut, boundary, kept)
+            kept, _, _ = compression.apply(kept, cut + 1, boundary, frozen,
+                                           cfg.compression.min_result_tokens, never_tools)
+        body = sum(estimate_tokens(m["content"]) for m in kept if isinstance(m.get("content"), str))
+        return (body + 4 * len(kept) + tools_tokens + estimate_tokens(orch.primary_system)
+                + cfg.memory.max_context_tokens + cfg.proxy.reply_reserve_tokens)
+
+    def size_layout(conversation_id: str, turn: int, original: list[dict], tools_tokens: int,
+                    covered: int) -> tuple[int, int, int]:
+        """(cut, boundary, estimated tokens) for size-triggered trimming.
+
+        Nothing changes while the prompt fits num_ctx. When it would not fit:
+        compress old tool output first; if still above the target, cut the oldest
+        turns until the estimate is at trim_target_ratio of the window. The layout
+        only ever moves forward and then stays put until the window fills again,
+        so the prompt prefix (and Ollama's cache) is stable for many turns.
+        """
+        limit = cfg.ollama.primary.num_ctx
+        target = int(limit * cfg.proxy.trim_target_ratio)
+        cut, boundary = size_state.get(conversation_id, (0, 0))
+        cut = min(cut, max(0, turn - 1))
+        size = estimate_prompt(conversation_id, original, tools_tokens, cut, boundary)
+        if size > limit:
+            if cfg.compression.enabled:
+                boundary = max(boundary, turn - cfg.compression.keep_recent_user_turns)
+                size = estimate_prompt(conversation_id, original, tools_tokens, cut, boundary)
+            if size > target:
+                max_cut = max(cut, turn - cfg.proxy.trim_keep_user_turns)
+                if cfg.proxy.trim_requires_summary and cfg.session.summaries_enabled:
+                    max_cut = max(cut, min(max_cut, covered))
+                for d in range(cut + 1, max_cut + 1):
+                    cut = d
+                    size = estimate_prompt(conversation_id, original, tools_tokens, cut, boundary)
+                    if size <= target:
+                        break
+        size_state[conversation_id] = (cut, boundary)
+        size_state.move_to_end(conversation_id)
+        while len(size_state) > 512:
+            size_state.popitem(last=False)
+        return cut, boundary, size
+
+    def plan_for(conversation_id: str, turn: int, user_text: str, original: list[dict],
+                 tools_tokens: int = 0) -> TurnPlan:
         key = (conversation_id, turn, hash(user_text))
         if key in plans:
             plans.move_to_end(key)
             return plans[key]
-        drop = stepped_drop(turn, cfg.proxy.trim_trigger_user_turns, cfg.proxy.trim_keep_user_turns)
-        summary = orch.session_summary(conversation_id) if drop else None
-        covered = summary["covered_turns"] if summary else 0
-        if drop and cfg.proxy.trim_requires_summary and cfg.session.summaries_enabled:
-            drop = min(drop, covered)  # never cut what the summary doesn't cover yet
-        ctx = orch.context_builder.build(
-            user_text, session_summary=summary["summary"] if (drop and summary) else None) \
-            if cfg.proxy.inject_memory else BuiltContext("", 0)
-        plan = TurnPlan(drop, ctx, covered)
+        est_size = None
+        if size_mode():
+            summary = orch.session_summary(conversation_id)
+            covered = summary["covered_turns"] if summary else 0
+            drop, boundary, est_size = size_layout(conversation_id, turn, original, tools_tokens, covered)
+        else:
+            drop = stepped_drop(turn, cfg.proxy.trim_trigger_user_turns, cfg.proxy.trim_keep_user_turns)
+            summary = orch.session_summary(conversation_id) if drop else None
+            covered = summary["covered_turns"] if summary else 0
+            if drop and cfg.proxy.trim_requires_summary and cfg.session.summaries_enabled:
+                drop = min(drop, covered)  # never cut what the summary doesn't cover yet
+            boundary = 0
+            if cfg.compression.enabled:
+                boundary = compression.compress_boundary(
+                    turn, drop, trim_keep=cfg.proxy.trim_keep_user_turns,
+                    keep_recent=cfg.compression.keep_recent_user_turns,
+                    step=cfg.compression.step_turns, trimming=bool(cfg.proxy.trim_trigger_user_turns))
+
+        # The memory base refreshes only when the prefix changes anyway (trim point or
+        # compression boundary moved); with both off, on its own schedule.
+        base = None
+        if cfg.proxy.inject_memory and cfg.proxy.append_system_prompt:
+            if size_mode() or cfg.proxy.trim_trigger_user_turns or cfg.compression.enabled:
+                epoch = ("layout", drop, boundary)
+            else:
+                epoch = ("turns", turn // cfg.stable_memory.refresh_turns)
+            base = orch.memory_base(conversation_id, epoch)
+
+        if cfg.proxy.inject_memory:
+            budget = cfg.memory.max_context_tokens - (base.tokens if base else 0)
+            ctx = orch.context_builder.build(
+                user_text, max_tokens=budget, base=base,
+                session_summary=summary["summary"] if (drop and summary) else None,
+                preamble=not cfg.proxy.append_system_prompt)
+        else:
+            ctx = BuiltContext("", 0)
+        plan = TurnPlan(drop, ctx, covered, boundary=boundary, base=base, est_size=est_size)
+        orch.record_usage(list(ctx.included) + list(base.fingerprints if base else ()))  # once per turn
         if cfg.compression.enabled:
-            plan.boundary = compression.compress_boundary(
-                turn, drop, trim_keep=cfg.proxy.trim_keep_user_turns,
-                keep_recent=cfg.compression.keep_recent_user_turns,
-                step=cfg.compression.step_turns, trimming=bool(cfg.proxy.trim_trigger_user_turns))
-            plan.frozen = frozen_digests(conversation_id, drop, plan.boundary,
-                                         drop_user_turns(original, drop))
+            plan.frozen = frozen_digests(conversation_id, drop, boundary, drop_user_turns(original, drop))
         plans[key] = plan
         while len(plans) > 256:
             plans.popitem(last=False)
@@ -276,7 +358,9 @@ def build_router(orch: Orchestrator) -> APIRouter:
         messages = original
         if isinstance(user_text, str):
             turn = sum(1 for m in original if m.get("role") == "user")
-            plan = plan_for(conversation_id, turn, user_text, original)
+            tools_tokens = estimate_tokens(json.dumps(body["tools"], ensure_ascii=False)) \
+                if body.get("tools") else 0
+            plan = plan_for(conversation_id, turn, user_text, original, tools_tokens)
             info.update(user_text=user_text, user_index_original=uidx, turn=turn, plan=plan)
             messages = drop_user_turns(original, plan.drop)
             info["trimmed"] = len(original) - len(messages)
@@ -287,16 +371,22 @@ def build_router(orch: Orchestrator) -> APIRouter:
             messages = list(original)
 
         if cfg.proxy.append_system_prompt:
+            system_add = orch.system_prompt(info["plan"].base if info["plan"] else None)
             if messages and messages[0].get("role") == "system" and isinstance(messages[0].get("content"), str):
                 messages[0] = {**messages[0],
-                               "content": messages[0]["content"].rstrip() + "\n\n" + orch.primary_system}
+                               "content": messages[0]["content"].rstrip() + "\n\n" + system_add}
             else:
-                messages.insert(0, {"role": "system", "content": orch.primary_system})
+                messages.insert(0, {"role": "system", "content": system_add})
 
         plan = info["plan"]
         if plan is not None and plan.ctx.text:
-            idx = last_user_index(messages)
-            messages[idx] = {**messages[idx], "content": wrap_user_request(plan.ctx.text, user_text)}
+            # Attach the block to the LAST message (the user's message, or the newest tool
+            # result mid tool-loop). Next request that message reappears without the block,
+            # so only the block itself drops out of the cache, never the tool output after it.
+            idx = len(messages) - 1
+            if messages[idx].get("role") not in ("user", "tool") or not isinstance(messages[idx].get("content"), str):
+                idx = last_user_index(messages)
+            messages[idx] = {**messages[idx], "content": wrap_user_request(plan.ctx.text, messages[idx]["content"])}
             info["memory_tokens"] = plan.ctx.token_estimate
             info["memory_ids"] = plan.ctx.included
         out["messages"] = messages
@@ -322,9 +412,13 @@ def build_router(orch: Orchestrator) -> APIRouter:
                "turn": info.get("turn"),
                "memory_retrieval_count": len(info["memory_ids"]),
                "memory_tokens": info["memory_tokens"],
+               "memory_base_tokens": plan.base.tokens if plan and plan.base else 0,
                "total_context_tokens": info["total_context_tokens"],
                "history_messages_trimmed": info["trimmed"],
                "user_turns_dropped": plan.drop if plan else 0,
+               "est_prompt_tokens": plan.est_size if plan else None,
+               "context_over_budget": bool(plan and plan.est_size and cfg.ollama.primary.num_ctx
+                                           and plan.est_size > cfg.ollama.primary.num_ctx),
                "tool_results_compressed": info.get("tool_results_compressed", 0),
                "tool_tokens_saved": info.get("tool_tokens_saved", 0),
                "memory_flags": len(stripper.flags) if stripper else 0,
@@ -368,6 +462,7 @@ def build_router(orch: Orchestrator) -> APIRouter:
             return await passthrough(request, "api/chat", raw)
 
         request_id = uuid.uuid4().hex[:12]
+        orch.touch()
         conversation_id = conversation_id_for(request, body)
         out, info = prepare(body, conversation_id)
         stream = out.get("stream", True) is not False

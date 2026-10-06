@@ -21,7 +21,7 @@ leaves the machine.
 
 **Contents:** 1 Requirements · 2 Plan your setup · 3 Install · 4 Start two pinned Ollama instances ·
 5 Configure · 6 Start and verify · 7 Connect a client · 8 Tune for your VRAM · 9 How it works ·
-10 CLI and API · 11 Measure · 12 Troubleshooting · 13 Limitations
+10 CLI and API · 11 Evaluate · 12 Troubleshooting · 13 Limitations
 
 ---
 
@@ -241,10 +241,11 @@ All context-saving features are on by default and scale with your settings.
 | Feature | Settings | Rule of thumb |
 |---|---|---|
 | Memory injection | `memory.max_context_tokens` | ~15% of primary `num_ctx`. Clients with large system prompts or many tools (agents) need more free room. |
-| Stepped history trimming | `proxy.trim_trigger_user_turns` / `trim_keep_user_turns` | Small context (8–16k): 10 / 4. Large context (32k+): 20 / 8, or `0` to disable. |
+| Keeping history in the window | `proxy.trim_mode` (`size`), `trim_target_ratio`, `reply_reserve_tokens`, `trim_keep_user_turns` | `size` mode needs no tuning: nothing happens until the prompt would not fit `num_ctx`. Lower `trim_target_ratio` (e.g. 0.4) is cheaper on very long sessions; verify accuracy with golden questions (§11). |
 | Tool-output compression | `compression.min_result_tokens`, `keep_recent_user_turns`, `digest_max_tokens` | Defaults suit most setups. `keep_recent` must be smaller than `trim_keep`. |
 | Session summaries | `session.summary_max_tokens` | 400; raise it if long sessions lose details. |
 | Memory flags | `flags.enabled` | On; costs the primary ~20–50 tokens only on turns that flag something. |
+| Memory base (cached) | `stable_memory.max_tokens`, `categories` | ~40% of `memory.max_context_tokens`. It's part of that budget, not extra. |
 
 If `ai status` ever shows less than 100% GPU, **lower `num_ctx` first**. Keep the client's own
 context-window setting (e.g. OpenClaw `contextWindow`) equal to `ollama.primary.num_ctx`.
@@ -256,13 +257,18 @@ context-window setting (e.g. OpenClaw `contextWindow`) equal to `ollama.primary.
 1. The turn plan is fixed once per user turn and reused for every tool-call round trip: the trim
    point, which old tool results become digests, and the memory block.
 2. Old history is trimmed in steps, and old large tool results are swapped for digests (§9.4).
-3. Relevant memory and the session summary are wrapped as `<PROJECT_MEMORY>…</PROJECT_MEMORY>` in
-   the **latest** user message, so earlier history stays byte-identical and Ollama's prompt cache
-   keeps hitting.
-4. `prompts\primary_system.txt` (and the flag instruction) is appended to the client's system prompt,
+3. Rarely-changing memory (constraints, objectives, environment) goes into the **system prompt** as a
+   frozen `<PROJECT_MEMORY_BASE>`, where the prompt cache reaches it (§9.5).
+4. Everything turn-specific (current state, relevant lessons, decisions and discoveries, the session
+   summary, and any base changes since it was frozen) is **appended** as `<PROJECT_MEMORY>…</PROJECT_MEMORY>`
+   to the **last message** of the request: the user's message, or the newest tool result mid tool-loop.
+   On the next request that message comes back without the block, so only the block itself drops out
+   of the cache. The evaluation harness showed that putting it in front of the user's message instead
+   made every agent turn re-read the previous turn's tool output.
+5. `prompts\primary_system.txt` (and the flag instruction) is appended to the client's system prompt,
    and `num_ctx` is set if the client didn't.
-5. The reply streams back with tool calls intact and `<memory_flag>` tags removed.
-6. When the reply has no pending tool calls, the turn is over. It is written to raw JSONL, and the
+6. The reply streams back with tool calls intact and `<memory_flag>` tags removed.
+7. When the reply has no pending tool calls, the turn is over. It is written to raw JSONL, and the
    background queue gets, in priority order: the session-summary update, digests for large tool
    results, and memory extraction (if the turn was flagged or matched the trigger heuristics).
 
@@ -300,17 +306,84 @@ remain as a fallback for turns the primary forgets to flag.
 
 - **Session summary:** after every turn the memory model updates a rolling summary of that
   conversation. Summaries only move forward (a late retry can't overwrite a newer one).
-- **Stepped trimming:** past `trim_trigger_user_turns`, the oldest turns are cut back to about
-  `trim_keep_user_turns`, and the summary is injected as `SESSION SO FAR`. The cut point moves in steps
-  (with 10/4: turns 11, 16, 22, …), so the prompt prefix stays identical in between and the cache hits.
-  Turns the summary doesn't cover yet are never cut.
+- **Keeping history inside the window (`trim_mode: size`, default):** each turn the orchestrator
+  estimates the full prompt: history, the client's tool schemas, our system additions, plus reserves for
+  the memory block and the reply. **While it fits `num_ctx`, nothing is trimmed or compressed**, however
+  long the session. When it would not fit:
+  1. old tool results are replaced by digests first (they're usually the bulk);
+  2. if the prompt is still above `trim_target_ratio` (50%) of the window, the oldest turns are cut until
+     it isn't, and the session summary is injected as `SESSION SO FAR`.
+
+  Cutting well below the limit (hysteresis) means the layout then stays fixed for many turns, so the
+  prompt prefix is identical and Ollama's cache hits until the window fills again. The layout only ever
+  moves forward, at least `trim_keep_user_turns` recent turns are always kept, and turns the summary
+  doesn't cover yet are never cut. If the prompt can't be made to fit without breaking those rules, the
+  request is flagged `context_over_budget` in `/metrics` instead of silently losing content.
+- **Turn-count trimming (`trim_mode: turns`):** the older schedule. Past `trim_trigger_user_turns`
+  turns, history is cut back to about `trim_keep_user_turns` in fixed steps (with 10/4: turns 11, 16, 22, …),
+  and the compression boundary moves on the same turns. It's simpler, but it trims even when everything
+  would have fit, which costs cache misses on sessions that never needed it.
 - **Tool-output compression:** large tool results from older turns are replaced by digests labelled
   `[compressed tool output: original ~N tokens; re-run the tool if exact output is needed]`. The
   current turn and the last `keep_recent_user_turns` are never touched. A digest is only used if it
-  exists, respected its length limit and saves at least half. The boundary moves on the same turns as
-  the trim point, and the set of compressed results is frozen in between.
+  exists, respected its length limit and saves at least half. The compression boundary only moves when
+  the layout changes (in size mode: when the window fills; in turn mode: with the trim point), and the
+  set of compressed results is frozen in between.
 - Cuts only happen at user-message boundaries, so tool-call chains are never split. The client keeps its
   full history on its side; only what is sent to the model shrinks.
+
+### 9.5 The cached memory base
+
+Without it, all injected memory sits in the latest user message, after the cached prefix, so Ollama
+re-processes the whole block (up to `memory.max_context_tokens`) on every turn. Most of it is the
+same every time: constraints, objectives, environment. Those now go at the end of the system prompt,
+which is part of the cached prefix:
+
+- **Frozen per epoch.** The base is rebuilt only when the trim point or compression boundary moves,
+  i.e. on turns where the prefix changes and the cache misses anyway. With both features off, it
+  refreshes every `stable_memory.refresh_turns` turns. Entries are ordered by id, so unchanged memory
+  rebuilds to byte-identical text and causes no miss at all.
+- **Never stale.** If a base entry is added, edited or deactivated mid-epoch, the next turn's
+  per-turn block carries an `UPDATED SINCE THE MEMORY BASE` section with the new version (or
+  "no longer applies"), which the model is told takes precedence. At the next refresh the change moves
+  into the base and the update line disappears.
+- **No duplication, no extra context.** Entries in the base are skipped by per-turn retrieval. Entries
+  that didn't fit the base's `max_tokens` fall back to normal relevance retrieval. The base comes out of
+  `memory.max_context_tokens`, so total memory in the context window doesn't grow.
+- `current state` is deliberately not in the base by default: it changes most often. Add or remove
+  categories with `stable_memory.categories`.
+
+`ai memory context "prompt"` prints both parts. In `/metrics`, `memory_base_tokens` is the cached
+part and `memory_tokens` is what is re-processed every turn.
+
+### 9.6 Idle-time consolidation
+
+Memory grows by accretion, so near-duplicates and overgrown entries pile up and both inflate the
+injected context and weaken retrieval. When the system is idle, the memory GPU tidies up:
+
+- **When it runs:** no client request for `consolidation.idle_minutes` (10), the task queue is empty,
+  at least `min_interval_hours` (12) since the last run, and at least `min_changes_since_last` (5)
+  memory changes since then. A run stops as soon as a request or queued task arrives, and resumes
+  later. Run it on demand with `ai memory consolidate` or `POST /memory/consolidate`; add
+  `--dry-run` / `?dry_run=true` to see proposals without applying them.
+- **What it does:** per category, a deterministic similarity pre-filter forms small groups of related
+  entries, and only those groups are shown to the memory model. It may propose a **merge** (keep the
+  oldest id, deactivate the others) or a **rewrite** of a long entry. It can never add entries, and it
+  never deactivates anything except as part of a merge.
+- **Checked in code before anything is written:** every id must exist, be active and belong to the
+  group shown; the same safety rules as extraction apply; the new text must keep at least
+  `identifier_coverage` (90%) of the names, numbers, ports, paths and versions of the originals;
+  rewrites must shrink to at most `rewrite_max_ratio` (80%); and at most `max_changes_per_run` entries
+  change per run.
+- **Reversible:** a backup snapshot is taken before the first change of a run. Merged entries stay in
+  the file's inactive section, and every applied or rejected proposal is in `ai memory changes`.
+  `ai memory restore <backup-dir>` puts a snapshot's memory files back (after snapshotting the
+  present) and rebuilds the SQLite index.
+- **Unused entries are listed, never removed.** Every time an entry is injected, its use is recorded.
+  `ai memory review` (`GET /memory/review`) lists active entries older than `stale_after_days` (30)
+  that haven't been injected in that time, for you to decide on.
+
+`GET /memory/consolidation` shows whether a run is due, why or why not, and the last run's report.
 
 ## 10. CLI and API
 
@@ -319,13 +392,15 @@ remain as a fallback for turns the primary forgets to flag.
 ```
 ai serve | chat [-v] | status | metrics
 ai memory show [category] | search "text" | context "prompt" | changes | tasks | sessions
-ai memory validate | backup | rebuild [--replay [--reset]] | consolidate
+ai memory validate | backup | rebuild [--replay [--reset]] | restore <backup-dir>
+ai memory consolidate [--dry-run] | review
+ai eval sessions | ai eval run [--variant a,b,…] [--sessions …] [--golden …] [--max-turns N]
 ```
 
 `ai memory context "prompt"` shows exactly what would be injected for a prompt. `rebuild` alone
 rebuilds SQLite from the Markdown; `--replay` re-queues all raw history through the memory model;
 `--reset` starts from empty memory first. A snapshot to `backups\` is always taken beforehand. Stop the
-server (or use the API) before CLI rebuilds.
+server (or use the API) before CLI commands that write memory: rebuild, restore, consolidate.
 
 | Method | Path | |
 |---|---|---|
@@ -335,24 +410,88 @@ server (or use the API) before CLI rebuilds.
 | GET | `/memory/state`, `/memory/search?q=`, `/memory/context?q=` | inspect memory |
 | GET | `/memory/changes`, `/memory/tasks`, `/memory/sessions` | audit trail, queue, summaries |
 | POST | `/memory/rebuild`, `/memory/backup` | maintenance |
-| POST | `/memory/consolidate` | not implemented yet (501) |
+| POST | `/memory/consolidate[?dry_run=true]` | run consolidation now (§9.6) |
+| GET | `/memory/consolidation`, `/memory/review` | consolidation status and last report; unused entries |
 | * | `/api/*`, `/v1/*`, `/` | passthrough to the primary instance (memory only on `/api/chat`) |
 
 Logs: `logs\orchestrator.log`, `primary.log`, `memory.log` (JSON lines), plus each Ollama
 instance's log when started by the script.
 
-## 11. Measure
+## 11. Evaluate
 
-Every feature can be switched off in `config.yaml`. Compare runs of the same kind of session with a
-feature on and off in `/metrics`: `prompt_tokens` (tokens Ollama actually had to process; cache hits
-lower it), `prefill_time`, `time_to_first_token`, `memory_tokens`, `user_turns_dropped`,
-`tool_tokens_saved`, `memory_flags`.
+Every feature trades some risk against tokens. The evaluation harness measures both on **your**
+sessions, **your** models and **your** GPUs, so you can choose settings by numbers instead of by feel.
 
-Quality signals worth checking weekly:
-- `ai memory changes`: a high rejection rate means the memory model is too small or confused.
-- `ai memory sessions`: whether summaries keep the specifics you care about.
-- Whether the primary re-runs tools it already ran. If so, digests are dropping something; raise
-  `digest_max_tokens` or add the tool to `never_compress_tools`.
+```
+ai eval sessions                                   # recorded sessions available for replay
+ai eval run                                        # baseline vs full on your last 3 sessions + golden.yaml
+ai eval run --variant baseline,full,no-compression --sessions oc-1234,oc-5678 --max-turns 40
+```
+
+### 11.1 What it measures
+
+- **Cost (context replay).** Each recorded turn is re-sent through the real orchestrator code with the
+  *recorded* history and just 1 generated token. Every variant therefore sees the identical conversation
+  and differs only in context strategy. Session summaries and tool digests are produced live by your
+  memory model from the recorded answers. Per variant you get:
+  - **processed prompt tokens:** what Ollama actually had to evaluate, cache hits excluded
+  - **prefill time**
+  - **estimated cache hit rate**
+  - **peak context size**
+  - **turns over `num_ctx`**
+  - memory tokens per turn, tool tokens saved, turns trimmed
+- **Accuracy (golden questions).** After replaying a session, a question is asked with real generation
+  (temperature 0, fixed seed, thinking off by default) and graded deterministically: `expect_all`,
+  `expect_any`, `forbid`, with `/regex/` support. There is no LLM judge, so there is no judge bias.
+  Copy `examples\golden.example.yaml` to `evals\golden.yaml` and write cases about your own work. The
+  most informative ones ask about details from **early** in a long session (tests trimming and
+  summaries), from **old tool output** (tests compression), or facts that only live in long-term memory.
+
+### 11.2 Variants
+
+A variant is a set of `config.yaml` overrides with dotted keys. `baseline` (plain Ollama behaviour:
+full history, nothing injected) and `full` (your config as-is) always exist. Define more in
+`evals\variants.yaml`; see `examples\variants.example.yaml`. The first variant in `--variant` is the
+one the others are compared against.
+
+### 11.3 Isolation and fairness
+
+- Each variant runs in its own workspace (`evals\runs\<timestamp>\<variant>\`) with a copy of your
+  memory (`--memory empty` to start blank) and a fresh database. Your real memory, database and logs
+  are never written. Extraction is off unless you pass `--extract`.
+- A unique marker at the start of each run's system prompt stops one variant from reusing another's
+  cached prefix. Both models are warmed up before each variant, so load time doesn't skew the first one.
+- **Stop the orchestrator server** while evaluating (the harness warns if it's running). Live traffic
+  on the same Ollama instances distorts cache and timing numbers.
+- Your client's real system prompt and tool schemas aren't in the logs. Pass them with
+  `--client-system file.txt` for realistic absolute numbers; relative comparisons are valid either way.
+
+### 11.4 Reading the report
+
+Reports go to `evals\reports\<timestamp>.md` (plus `.json` with every turn). Rules of thumb:
+
+- **Turns over `num_ctx` is the first column to read.** Those prompts didn't fit, so Ollama silently
+  dropped the oldest content. A variant can look cheap on those turns precisely because it lost
+  information. Keeping long sessions inside the window is what trimming and compression are for.
+- Among variants with no overflow, prefer the one with fewer processed tokens **only if** its golden
+  pass rate is no worse.
+- What to expect, from synthetic sessions with a 16k window (run it on your own; that's the point):
+
+  | Session | baseline | `full` (size mode) |
+  |---|---|---|
+  | 24 short chatty turns, fits the window | — | +10% processed tokens (mostly the one-time, then-cached system prompt) |
+  | 24 tool-heavy turns, ~45k tokens | over `num_ctx` on 16 turns | never over; +27–34% processed tokens |
+  | 60 tool-heavy turns, ~59k tokens | over `num_ctx` on 43 turns | never over; +33% (+17% with `trim_target_ratio: 0.4`) |
+
+  The extra processing on long sessions is the price of staying inside the window: occasional full
+  re-reads when the layout moves, plus the summary. Baseline looks cheaper there only because Ollama is
+  silently throwing content away.
+- Estimated cache hit is calibrated on each run's first (cold) request and is approximate. Processed
+  tokens and prefill time are exact.
+
+For day-to-day monitoring without a full eval, `/metrics` shows the same per-request fields from live
+traffic. `ai memory changes` (rejection rate), `ai memory sessions` (summary quality) and
+`ai memory review` (unused entries) cover the memory side.
 
 ## 12. Troubleshooting
 
@@ -365,16 +504,17 @@ Quality signals worth checking weekly:
 | Client in WSL can't reach :8000 | Mirrored networking not enabled (§7.3) |
 | Memory changes are mostly rejected | Memory model too small or thinking mode on; set `think: false` or try a larger model |
 | `memory file errors` in status | A hand edit broke the format; run `ai memory validate` and fix the reported line |
-| History never gets trimmed | The summary isn't keeping up (check `ai memory tasks`), or `trim_trigger_user_turns: 0` |
+| Consolidation never runs | Check `GET /memory/consolidation`: it states the reason (not idle, queue busy, ran recently, too few changes) |
+| History never gets trimmed | In size mode that's normal while the prompt fits `num_ctx`. If `context_over_budget` shows up, the summary isn't keeping up (check `ai memory tasks`) |
 | Client compacts or refuses at small context | Its own context precheck; raise `num_ctx` and the client's context window together if VRAM allows |
 
 ## 13. Limitations and ideas
 
 - **Not built yet:** embedding-based retrieval (keyword search is used; `MemoryRetriever` is the
-  interface to implement), memory consolidation, multi-project namespaces (the schema already has
-  `project_id`), and an evaluation harness that replays sessions with features on and off.
+  interface to implement), and multi-project namespaces (the schema already has
+  `project_id`).
 - A large second GPU could take on more: embeddings, a bigger memory model, or splitting one large
   primary model across both cards instead. That trades the memory system for raw model size.
-- Tested with fake Ollama instances (86 tests: validator, atomic writes, streaming, flag stripping,
-  trimming and compression cache stability, retries…). Real-GPU behaviour (pinning, VRAM fit, a given
-  model's JSON quality) can only be verified on your machine (§4.5, §11).
+- Tested with fake Ollama instances (126 tests: validator, atomic writes, streaming, flag stripping,
+  trimming, compression and memory-base cache stability, consolidation guards, evaluation harness, retries…). Real-GPU behaviour (pinning, VRAM fit, a given
+  model's JSON quality) can only be verified on your machine (§4.5); the evaluation harness (§11) is how you do that.

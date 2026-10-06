@@ -156,6 +156,26 @@ class MemoryManager:
         log.info("backup created", extra={"detail": str(dest)})
         return dest
 
+    def restore(self, backup_dir: Path) -> dict:
+        """Put the memory Markdown from a backup snapshot back (after snapshotting the present)."""
+        src = Path(backup_dir) / "memory"
+        if not src.is_dir():
+            raise FileNotFoundError(f"{src} not found")
+        files = {s.filename: s for s in self.stores.values()}
+        found = [p for p in src.glob("*.md") if p.name in files]
+        if not found:
+            raise FileNotFoundError(f"no memory files in {src}")
+        for p in found:  # validate everything before touching anything
+            files[p.name].parse(p.read_text(encoding="utf-8"))
+        before = self.snapshot("pre-restore")
+        for p in found:
+            store = files[p.name]
+            store.replace_all(store.parse(p.read_text(encoding="utf-8")).entries)
+        n = self.sync_db_from_markdown()
+        log.info("memory restored", extra={"detail": f"from {backup_dir}; pre-restore backup {before}"})
+        return {"restored_from": str(backup_dir), "files": sorted(p.name for p in found),
+                "pre_restore_backup": str(before), "db_entries": n}
+
     def memory_tokens(self) -> int:
         return sum(estimate_tokens(s.path.read_text(encoding="utf-8"))
                    for s in self.stores.values() if s.path.exists())

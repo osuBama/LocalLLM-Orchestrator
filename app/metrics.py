@@ -67,6 +67,7 @@ class Metrics:
                     return round(mean(vals), 3) if vals else None
                 by_mode[mode] = {"count": len(sub), "avg_prompt_tokens": a("prompt_tokens"),
                                  "avg_memory_tokens": a("memory_tokens"),
+                                 "avg_memory_base_tokens": a("memory_base_tokens"),
                                  "avg_prefill_time": a("prefill_time"),
                                  "avg_time_to_first_token": a("time_to_first_token"),
                                  "avg_total_request_time": a("total_request_time"),

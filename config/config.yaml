@@ -3,7 +3,7 @@
 # variable overrides paths.root; AI_CONFIG points at an alternative config file.
 
 paths:
-  root: "G:\\AI"
+  root: "D:\\AI"                # your install folder (or set AI_ROOT)
   memory: "memory"
   conversations: "conversations"
   database: "database\\memory.db"
@@ -12,26 +12,26 @@ paths:
   prompts: "prompts"
 
 ollama:
-  # Instance A: pinned to the RTX 5070 (12 GB) by scripts\start-ollama-instances.ps1
+  # Instance A: the primary GPU (README §2, §4)
   primary:
     base_url: "http://127.0.0.1:11434"
     model: "qwen3:14b"          # default for POST /chat; proxied requests keep their own model
     timeout_seconds: 600
-    num_ctx: 16384              # ~9 GB weights + q8_0 KV cache fits a 12 GB card
+    num_ctx: 16384              # size to your VRAM (README §2.2); qwen3:14b at 16k fits 12 GB with q8_0 KV
     keep_alive: "30m"
 
-  # Instance B: pinned to the RTX 2070 SUPER (8 GB)
+  # Instance B: the memory GPU
   memory:
     base_url: "http://127.0.0.1:11435"
     model: "qwen3:8b"
     timeout_seconds: 600
     num_ctx: 8192
     keep_alive: "30m"
-    think: false                # qwen3 thinking off: faster, cleaner JSON
+    think: false                # for models with a thinking mode; remove the line for others
 
 memory:
   project_id: "default"
-  max_context_tokens: 2500      # memory budget injected into the primary prompt
+  max_context_tokens: 2500      # memory budget injected into the primary prompt (~15% of primary num_ctx)
   max_memory_file_tokens: 4000  # `ai memory validate` warns when a file grows past this
   max_entry_tokens: 600         # single entries longer than this are truncated in context
   enable_semantic_retrieval: false   # Phase 3
@@ -59,7 +59,16 @@ proxy:
   inject_memory: true
   append_system_prompt: true    # appends prompts/primary_system.txt to the client's system prompt
   queue_memory_updates: true
-  # Stepped trimming of OpenClaw's history. When it grows past 10 user turns it is cut
+  # trim_mode "size" (default): nothing is trimmed or compressed while the prompt fits
+  # ollama.primary.num_ctx (minus memory budget and reply_reserve_tokens). When it would not
+  # fit: old tool output is compressed first, then the oldest turns are cut back to
+  # trim_target_ratio of the window, so the next change is many turns away.
+  # trim_mode "turns": the older turn-count schedule below.
+  trim_mode: size
+  trim_target_ratio: 0.5       # lower = deeper, rarer cuts (cheaper, leans more on summaries)
+  reply_reserve_tokens: 1024
+  # Turn-count trimming (trim_mode: turns). In size mode trim_keep_user_turns is the minimum
+  # number of recent turns always kept verbatim. When it grows past 10 user turns it is cut
   # back to ~4; the cut point then stays put for 5-6 turns so the prompt cache keeps hitting.
   # The session summary + memory stand in for what was cut. 0 = never trim.
   trim_trigger_user_turns: 10
@@ -83,6 +92,31 @@ compression:
   digest_max_tokens: 200
   step_turns: 6                 # boundary schedule before trimming starts / with trimming off
   never_compress_tools: []      # e.g. ["read_file"] to always keep a tool's output verbatim
+
+stable_memory:
+  # Constraints, objectives and environment rarely change, so they go into the system prompt
+  # as a frozen "memory base" that Ollama's prompt cache can reuse. It is refreshed only on turns
+  # where the prompt prefix changes anyway (trim/compression steps). Changes in between are sent
+  # as small "UPDATED SINCE" lines with the user's message, so nothing is ever stale.
+  enabled: true
+  categories: [constraint, objective, environment]
+  max_tokens: 1000              # part of memory.max_context_tokens, not extra
+  refresh_turns: 6              # only used when trimming and compression are both off
+
+consolidation:
+  # Idle-time memory hygiene on the memory GPU. Merges near-duplicate entries and tightens
+  # overgrown ones; never adds entries and never deletes on its own. Every run takes a backup.
+  enabled: true
+  idle_minutes: 10              # no requests for this long = idle
+  min_interval_hours: 12        # at most one automatic run per interval...
+  min_changes_since_last: 5     # ...and only if memory changed at least this much since
+  similarity_threshold: 0.5     # deterministic pre-filter: only similar entries are shown together
+  rewrite_min_tokens: 120       # entries longer than this may be tightened
+  rewrite_max_ratio: 0.8        # a rewrite must shrink the entry to at most 80%
+  identifier_coverage: 0.9      # merges/rewrites must keep 90% of names, numbers, paths, versions
+  max_changes_per_run: 10
+  max_cluster_size: 6
+  stale_after_days: 30          # `ai memory review` lists active entries never used for this long
 
 session:
   # Rolling per-conversation summary kept by the memory model, injected once history is trimmed.

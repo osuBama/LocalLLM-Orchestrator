@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+conversations/
+database/
+logs/
+backups/
+memory/history/
+evals/runs/
+evals/reports/

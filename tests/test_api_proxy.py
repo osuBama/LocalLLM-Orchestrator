@@ -34,8 +34,9 @@ def test_chat_injects_memory_logs_and_queues(env):
     sent = primary.requests[-1]["messages"]
     assert sent[0]["role"] == "system" and "primary problem-solving model" in sent[0]["content"]
     user = sent[-1]["content"]
-    assert "<PROJECT_MEMORY>" in user and "[C-001]" in user and "[L-001]" in user
-    assert "<USER_REQUEST>\nMCP gives 404 again, why?\n</USER_REQUEST>" in user
+    assert "<PROJECT_MEMORY_BASE>" in sent[0]["content"] and "[C-001]" in sent[0]["content"]
+    assert "<PROJECT_MEMORY>" in user and "[L-001]" in user and "[C-001]" not in user
+    assert user.startswith("MCP gives 404 again, why?\n\n<PROJECT_MEMORY>")  # block appended, not prepended
     recs = list(orch.conv_log.iter_records())
     assert [r["role"] for r in recs] == ["user", "assistant"]
 
@@ -77,7 +78,8 @@ def test_proxy_tool_loop_queues_only_final_turn(env):
     assert r.json()["message"]["tool_calls"][0]["function"]["name"] == "http_get"
     assert orch.db.list_tasks() == []                                  # mid-turn: nothing queued
 
-    first_ctx = primary.requests[-1]["messages"][-1]["content"]
+    first_msg = primary.requests[-1]["messages"][-1]["content"]
+    first_block = first_msg[first_msg.index("<PROJECT_MEMORY>"):]
     primary.tool_calls = None
     primary.reply = "The endpoint is /mcp"
     extra = [{"role": "assistant", "content": "", "tool_calls": [
@@ -85,8 +87,12 @@ def test_proxy_tool_loop_queues_only_final_turn(env):
              {"role": "tool", "tool_name": "http_get", "content": "404 Not Found"}]
     r = client.post("/api/chat", json=openclaw_body(stream=False, extra=extra))
     assert r.json()["message"]["content"] == "The endpoint is /mcp"
-    # Same memory block on every step of the turn (keeps the KV-cache prefix stable).
-    assert primary.requests[-1]["messages"][-3]["content"] == first_ctx
+    # Same memory block on every step of the turn, now attached to the LAST message (the tool
+    # result) so the user message keeps its cached form.
+    final = primary.requests[-1]["messages"]
+    assert final[-3]["content"] == "The MCP call returns 404, what now?"
+    assert final[-1]["role"] == "tool" and final[-1]["content"].startswith("404 Not Found\n\n<PROJECT_MEMORY>")
+    assert final[-1]["content"][final[-1]["content"].index("<PROJECT_MEMORY>"):] == first_block
     tasks = orch.db.list_tasks()
     assert sorted(t["kind"] for t in tasks) == ["extract", "summary"]
     types = [r["type"] for r in orch.conv_log.iter_records()]
@@ -109,7 +115,7 @@ def test_health_and_metrics(env):
     assert h["primary"]["reachable"] and h["memory"]["reachable"] and h["memory_files_ok"]
     m = client.get("/metrics").json()
     assert m["totals"]["requests"] == 1 and m["averages"]["prompt_tokens"] == 100
-    assert client.post("/memory/consolidate").status_code == 501
+    assert client.post("/memory/consolidate", params={"dry_run": True}).status_code == 200
 
 
 def test_end_to_end_memory_is_used_later(env):
@@ -124,7 +130,7 @@ def test_end_to_end_memory_is_used_later(env):
     assert orch.db.list_changes()[0]["status"] == "approved"
 
     client.post("/chat", json={"message": "Which GPU does the memory model use?"})
-    assert "[E-001] Memory GPU" in primary.requests[-1]["messages"][-1]["content"]
+    assert "[E-001] Memory GPU" in primary.requests[-1]["messages"][0]["content"]  # in the memory base
     assert client.get("/memory/search", params={"q": "2070 SUPER"}).json()["results"][0]["entry_id"] == "E-001"
 
 

@@ -123,6 +123,7 @@ def test_summary_task_priority_and_staleness(env):
 
 def test_trimming_with_summary_and_stable_prefix(env):
     client, orch, primary, _ = env
+    orch.config.proxy.trim_mode = "turns"   # this test covers the turn-count schedule
     body11 = history(11)
     cid = None
     # No summary yet -> nothing may be cut (trim_requires_summary).

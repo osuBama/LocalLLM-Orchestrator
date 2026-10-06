@@ -9,12 +9,12 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 
 import httpx
 
 from .config import Config
-from .context_builder import ContextBuilder, wrap_user_request
+from .context_builder import ContextBuilder, StableSnapshot, wrap_user_request
 from .flags import strip_flags
 from .conversation_logger import ConversationLogger
 from .database import Database
@@ -23,7 +23,7 @@ from .memory_retriever import KeywordRetriever
 from .memory_worker import MemoryWorker
 from .metrics import Metrics
 from .ollama_client import OllamaClient, OllamaError
-from .schemas import InteractionTask
+from .schemas import Category, InteractionTask
 from .util import estimate_tokens, now_iso
 
 log = logging.getLogger("orchestrator")
@@ -54,6 +54,11 @@ class Orchestrator:
             self.primary_system += "\n\n" + config.prompt("primary_flags.txt")
         self._recent: dict[str, deque] = {}
         self._turns: dict[str, int] = {}
+        self._bases: OrderedDict[tuple, StableSnapshot] = OrderedDict()
+        self.last_request_at = time.time()
+        from .consolidation import Consolidator
+        self.consolidator = Consolidator(self)
+        self.worker.idle_hook = self.idle_work
 
     async def aclose(self) -> None:
         await self.worker.stop()
@@ -74,6 +79,47 @@ class Orchestrator:
             except Exception:
                 log.exception("inline memory processing failed")
         return queued
+
+    def memory_base(self, conversation_id: str, epoch: tuple) -> StableSnapshot | None:
+        """Frozen memory base for this conversation and epoch (None when disabled).
+
+        Rebuilt only when the epoch changes; if memory hasn't changed, the rebuilt
+        text is byte-identical, so the cache still hits.
+        """
+        sm = self.config.stable_memory
+        if not sm.enabled:
+            return None
+        key = (conversation_id, epoch)
+        if key in self._bases:
+            self._bases.move_to_end(key)
+            return self._bases[key]
+        snap = self.context_builder.build_stable([Category(c) for c in sm.categories], sm.max_tokens)
+        self._bases[key] = snap
+        while len(self._bases) > 256:
+            self._bases.popitem(last=False)
+        return snap
+
+    def touch(self) -> None:
+        """A client request arrived: idle-time work must yield."""
+        self.last_request_at = time.time()
+
+    def record_usage(self, entry_ids) -> None:
+        try:
+            self.db.record_usage([i for i in entry_ids if i not in ("SESSION", "UPDATES")], self.project_id)
+        except Exception:
+            log.exception("usage recording failed")
+
+    async def idle_work(self) -> bool:
+        """Called by the worker when the queue is empty. Returns True if it did something."""
+        due, why = self.consolidator.due()
+        if not due:
+            return False
+        log.info("idle consolidation starting", extra={"detail": why})
+        await self.consolidator.run(trigger="idle")
+        return True
+
+    def system_prompt(self, base: StableSnapshot | None) -> str:
+        return self.primary_system + (f"\n\n{base.text}" if base and base.text else "")
 
     def session_summary(self, conversation_id: str) -> dict | None:
         if not self.config.session.summaries_enabled:
@@ -107,6 +153,7 @@ class Orchestrator:
         request_id = uuid.uuid4().hex[:12]
         conversation_id = conversation_id or uuid.uuid4().hex[:12]
         t0 = time.perf_counter()
+        self.touch()
         self.db.touch_conversation(conversation_id, self.project_id)
         self.conv_log.message(conversation_id, "user", message, project_id=self.project_id,
                               request_id=request_id)
@@ -117,9 +164,13 @@ class Orchestrator:
         self._turns[conversation_id] += 1
         turn_number = self._turns[conversation_id]
         summary = self.session_summary(conversation_id)
+        base = self.memory_base(conversation_id, ("chat", turn_number // self.config.stable_memory.refresh_turns))
+        budget = self.config.memory.max_context_tokens - (base.tokens if base else 0)
         # /chat never resends full history, so the summary is always useful once it exists.
-        ctx = self.context_builder.build(message, session_summary=summary["summary"] if summary else None)
-        messages = [{"role": "system", "content": self.primary_system}]
+        ctx = self.context_builder.build(message, max_tokens=budget, base=base, preamble=False,
+                                         session_summary=summary["summary"] if summary else None)
+        messages = [{"role": "system", "content": self.system_prompt(base)}]
+        self.record_usage(list(ctx.included) + list(base.fingerprints if base else ()))
         recent = self._recent.setdefault(conversation_id, deque(maxlen=max(1, self.config.conversation.recent_turns) * 2))
         if self.config.conversation.recent_turns:
             messages.extend(recent)
@@ -129,6 +180,7 @@ class Orchestrator:
                "primary_model": self.config.ollama.primary.model,
                "memory_model": self.config.ollama.memory.model,
                "memory_retrieval_count": len(ctx.included), "memory_tokens": ctx.token_estimate,
+               "memory_base_tokens": base.tokens if base else 0,
                "total_context_tokens": sum(estimate_tokens(m["content"]) for m in messages)}
         try:
             resp = await self.primary.chat(messages)
@@ -157,5 +209,6 @@ class Orchestrator:
                                 log_user=False, flags=flags, turn_number=turn_number)
         queued = await self.queue_memory(task)
         return {"conversation_id": conversation_id, "response": answer, "memory_update_queued": queued,
-                "request_id": request_id, "memory_entries_used": ctx.included,
+                "request_id": request_id,
+                "memory_entries_used": sorted(set(ctx.included) | set(base.fingerprints if base else ())),
                 "memory_flags": flags, "turn": turn_number}

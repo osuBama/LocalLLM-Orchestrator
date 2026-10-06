@@ -35,7 +35,7 @@ _INJECTION = [
                r"(previous|prior|above|earlier|your|system)\s+(instruction|prompt|rule|message)s?\b", re.I),
     re.compile(r"\byou (are|must) now\b", re.I),
     re.compile(r"\bnew (system )?instructions?\s*:", re.I),
-    re.compile(r"</?\s*(PROJECT_MEMORY|EXTERNAL_MEMORY|USER_REQUEST|system|assistant|user)\s*>", re.I),
+    re.compile(r"</?\s*(PROJECT_MEMORY_BASE|PROJECT_MEMORY|EXTERNAL_MEMORY|USER_REQUEST|system|assistant|user)\s*>", re.I),
     re.compile(r"<\|im_(start|end)\|>"),
 ]
 
@@ -90,6 +90,26 @@ class ValidationResult:
     accepted: list[ValidatedChange] = field(default_factory=list)
     rejected: list[Rejection] = field(default_factory=list)
     error: str | None = None
+
+
+def safety_issue(title: str, content: str, reason: str = "") -> str | None:
+    """Shared safety rules for anything the memory model writes. None = OK."""
+    for pat in _PATH_LIKE:
+        if pat.search(title):
+            return "path-like title"
+    if _TRAVERSAL.search(content):
+        return "path traversal in content"
+    for fld, text in (("title", title), ("content", content), ("reason", reason)):
+        for pat in _INJECTION:
+            if pat.search(text):
+                return f"instruction-like text in {fld}"
+        for pat in _DANGEROUS_COMMANDS:
+            if pat.search(text):
+                return f"dangerous command in {fld}"
+        for pat in _SECRETS:
+            if pat.search(text):
+                return f"possible secret in {fld}"
+    return None
 
 
 def _norm(s: str) -> str:
@@ -153,21 +173,9 @@ class MemoryValidator:
             raise _Reject(f"content too large ({len(content)} > {self.max_entry_chars} chars)")
         if ch.confidence < self.min_confidence:
             raise _Reject(f"confidence {ch.confidence} below {self.min_confidence}")
-        for pat in _PATH_LIKE:
-            if pat.search(title):
-                raise _Reject("path-like title")
-        if _TRAVERSAL.search(content):
-            raise _Reject("path traversal in content")
-        for fld, text in (("title", title), ("content", content), ("reason", ch.reason)):
-            for pat in _INJECTION:
-                if pat.search(text):
-                    raise _Reject(f"instruction-like text in {fld}")
-            for pat in _DANGEROUS_COMMANDS:
-                if pat.search(text):
-                    raise _Reject(f"dangerous command in {fld}")
-            for pat in _SECRETS:
-                if pat.search(text):
-                    raise _Reject(f"possible secret in {fld}")
+        issue = safety_issue(title, content, ch.reason)
+        if issue:
+            raise _Reject(issue)
 
         target_id = ch.target_id
         if target_id is not None:

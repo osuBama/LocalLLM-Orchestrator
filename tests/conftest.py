@@ -44,6 +44,8 @@ class FakeOllama:
         self.tool_calls: list | None = None
         self.memory_json: dict | str = {"changes": []}
         self.fail_status: int | None = None
+        self.simulate_cache = False     # prompt_eval_count = chars after the shared prefix / 4
+        self._last_prompt = ""
         self.app = FastAPI()
         app = self.app
 
@@ -57,9 +59,19 @@ class FakeOllama:
                 content = self.memory_json if isinstance(self.memory_json, str) else json.dumps(self.memory_json)
                 return {"model": body["model"], "message": {"role": "assistant", "content": content},
                         "done": True, "total_duration": 1_000_000}
+            evaluated = 100
+            if self.simulate_cache:
+                prompt = "".join(f"{m.get('role')}:{m.get('content', '')}\n" for m in body["messages"])
+                lcp = 0
+                for a, b in zip(prompt, self._last_prompt):
+                    if a != b:
+                        break
+                    lcp += 1
+                self._last_prompt = prompt
+                evaluated = max(1, (len(prompt) - lcp) // 4)
             final = {"model": body["model"], "done": True, "done_reason": "stop",
                      "message": {"role": "assistant", "content": ""},
-                     "prompt_eval_count": 100, "prompt_eval_duration": 50_000_000,
+                     "prompt_eval_count": evaluated, "prompt_eval_duration": evaluated * 100_000,
                      "eval_count": 10, "eval_duration": 200_000_000, "total_duration": 300_000_000}
             if body.get("stream", True) is False:
                 msg = {"role": "assistant", "content": self.reply}

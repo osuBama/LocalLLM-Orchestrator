@@ -1,0 +1,18 @@
+# Copy to <install>\evals\variants.yaml. Each variant = overrides of config.yaml
+# (dotted keys). "baseline" (plain Ollama behaviour) and "full" (your config as-is)
+# always exist; define more here and pick them with --variant.
+
+variants:
+  no-compression:
+    compression.enabled: false
+  no-memory-base:
+    stable_memory.enabled: false
+  no-trimming:
+    proxy.trim_mode: turns
+    proxy.trim_trigger_user_turns: 0
+  deeper-cuts:                  # cheaper on long sessions; check accuracy with golden questions
+    proxy.trim_target_ratio: 0.4
+  turn-schedule:                # the older turn-count trimming
+    proxy.trim_mode: turns
+  bigger-summary:
+    session.summary_max_tokens: 800

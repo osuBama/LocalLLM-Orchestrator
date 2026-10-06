@@ -118,6 +118,7 @@ def test_long_useless_digest_is_not_used(env):
 
 def test_proxy_compresses_old_results_and_keeps_prefix_stable(env):
     client, orch, primary, _ = env
+    orch.config.proxy.trim_mode = "turns"   # this test covers the turn-count schedule
     orch.db.set_digest(result_hash(BIG), "read_log", "- 300 pool lines, idle=3", 2000, 10, True)
 
     client.post("/api/chat", json=session(7))                       # boundary 0

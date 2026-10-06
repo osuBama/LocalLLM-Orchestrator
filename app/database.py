@@ -85,6 +85,19 @@ CREATE TABLE IF NOT EXISTS tool_digests (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS entry_usage (
+    project_id TEXT NOT NULL DEFAULT 'default',
+    entry_key TEXT NOT NULL,
+    use_count INTEGER NOT NULL DEFAULT 0,
+    last_used_at TEXT NOT NULL,
+    PRIMARY KEY (project_id, entry_key)
+);
+
+CREATE TABLE IF NOT EXISTS kv (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON memory_tasks(status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_changes_conv ON memory_changes(conversation_id);
 """
@@ -254,6 +267,51 @@ class Database:
         with self.connect() as c:
             return [dict(r) for r in c.execute(
                 "SELECT * FROM session_summaries ORDER BY updated_at DESC LIMIT ?", (limit,))]
+
+    # ------------------------------------------------------------ usage / kv
+    def record_usage(self, entry_keys: list[str], project_id: str = "default") -> None:
+        keys = sorted({k for k in entry_keys if k and "-" in k})
+        if not keys:
+            return
+        ts = now_iso()
+        with self.connect() as c:
+            c.executemany(
+                """INSERT INTO entry_usage (project_id, entry_key, use_count, last_used_at) VALUES (?,?,1,?)
+                   ON CONFLICT(project_id, entry_key) DO UPDATE SET
+                       use_count=use_count+1, last_used_at=excluded.last_used_at""",
+                [(project_id, k, ts) for k in keys])
+
+    def usage(self, project_id: str = "default") -> dict[str, dict]:
+        with self.connect() as c:
+            return {r["entry_key"]: dict(r) for r in c.execute(
+                "SELECT * FROM entry_usage WHERE project_id=?", (project_id,))}
+
+    def kv_get(self, key: str, default: str | None = None) -> str | None:
+        with self.connect() as c:
+            r = c.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+            return r["value"] if r else default
+
+    def kv_set(self, key: str, value: str) -> None:
+        with self.connect() as c:
+            c.execute("INSERT OR REPLACE INTO kv (key, value) VALUES (?,?)", (key, value))
+
+    def max_change_id(self) -> int:
+        with self.connect() as c:
+            return int(c.execute("SELECT COALESCE(MAX(id),0) m FROM memory_changes").fetchone()["m"])
+
+    def approved_changes_since(self, change_id: int, exclude_conversation: str | None = None) -> int:
+        q = "SELECT COUNT(*) n FROM memory_changes WHERE status='approved' AND id>?"
+        args: list = [change_id]
+        if exclude_conversation:
+            q += " AND COALESCE(conversation_id,'')<>?"
+            args.append(exclude_conversation)
+        with self.connect() as c:
+            return int(c.execute(q, args).fetchone()["n"])
+
+    def pending_task_count(self) -> int:
+        with self.connect() as c:
+            return int(c.execute("SELECT COUNT(*) n FROM memory_tasks WHERE status IN ('pending','processing')")
+                       .fetchone()["n"])
 
     # ------------------------------------------------------------ tool digests
     def get_digests(self, hashes: list[str]) -> dict[str, dict]:

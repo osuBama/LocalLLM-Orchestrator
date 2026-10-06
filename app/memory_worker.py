@@ -63,6 +63,8 @@ class MemoryWorker:
         self._task: asyncio.Task | None = None
         self._wake = asyncio.Event()
         self._stopping = False
+        self.idle_hook = None          # async () -> bool; runs only when the queue is empty
+        self.lock = asyncio.Lock()     # one memory-GPU job at a time (tasks, consolidation, API)
 
     # -------------------------------------------------------------- queue
     def enqueue(self, task: InteractionTask, force: bool = False) -> tuple[int, bool, list[str]]:
@@ -142,7 +144,10 @@ class MemoryWorker:
     async def _loop(self) -> None:
         while not self._stopping:
             try:
-                did = await self.process_next()
+                async with self.lock:
+                    did = await self.process_next()
+                    if not did and self.idle_hook is not None:
+                        did = await self.idle_hook()
             except Exception:  # never let the loop die
                 log.exception("memory worker loop error")
                 did = False

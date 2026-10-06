@@ -75,6 +75,13 @@ class ProxyConfig(_Strict):
     inject_memory: bool = True
     append_system_prompt: bool = True
     queue_memory_updates: bool = True
+    # How history is kept inside the context window:
+    #  "size"  - only when the estimated prompt would not fit num_ctx: first compress old tool
+    #            output, then cut old turns back to trim_target_ratio of the window (default)
+    #  "turns" - stepped by turn count (trim_trigger_user_turns / trim_keep_user_turns)
+    trim_mode: Literal["size", "turns"] = "size"
+    trim_target_ratio: float = Field(0.5, gt=0.1, lt=1.0)
+    reply_reserve_tokens: int = Field(1024, ge=0)
     # Stepped trimming: once history exceeds trim_trigger_user_turns, cut it back to
     # about trim_keep_user_turns. The cut point then stays fixed for several turns,
     # so Ollama's prompt cache keeps hitting. 0 disables trimming.
@@ -106,6 +113,33 @@ class CompressionConfig(_Strict):
     never_compress_tools: list[str] = Field(default_factory=list)
 
 
+class StableMemoryConfig(_Strict):
+    """Rarely-changing memory goes into the system prompt, frozen per epoch, so the
+    prompt cache reaches it. Changes in between arrive as small per-turn updates."""
+    enabled: bool = True
+    categories: list[Literal["constraint", "objective", "environment", "state",
+                             "decision", "lesson", "discovery"]] = \
+        Field(default_factory=lambda: ["constraint", "objective", "environment"])
+    max_tokens: int = Field(1000, ge=100)        # comes out of memory.max_context_tokens
+    refresh_turns: int = Field(6, ge=1)          # used only when trimming and compression are off
+
+
+class ConsolidationConfig(_Strict):
+    """Idle-time memory hygiene: merge near-duplicates, tighten overgrown entries,
+    list never-used entries for human review (never auto-deleted)."""
+    enabled: bool = True
+    idle_minutes: float = Field(10, gt=0)          # no requests for this long = idle
+    min_interval_hours: float = Field(12, ge=0)     # at most one automatic run per interval
+    min_changes_since_last: int = Field(5, ge=0)    # and only if memory changed this much since
+    similarity_threshold: float = Field(0.5, gt=0, le=1)  # pre-filter for merge candidates
+    rewrite_min_tokens: int = Field(120, ge=30)     # entries longer than this may be tightened
+    rewrite_max_ratio: float = Field(0.8, gt=0, le=1)     # a rewrite must be at most this long
+    identifier_coverage: float = Field(0.9, gt=0, le=1)   # share of names/numbers/paths to keep
+    max_changes_per_run: int = Field(10, ge=1)
+    max_cluster_size: int = Field(6, ge=2)
+    stale_after_days: int = Field(30, ge=1)         # review list: active but never injected
+
+
 class SessionConfig(_Strict):
     summaries_enabled: bool = True
     summary_max_tokens: int = Field(400, ge=50, le=2000)
@@ -126,6 +160,8 @@ class Config(_Strict):
     flags: FlagsConfig = FlagsConfig()
     session: SessionConfig = SessionConfig()
     compression: CompressionConfig = CompressionConfig()
+    stable_memory: StableMemoryConfig = StableMemoryConfig()
+    consolidation: ConsolidationConfig = ConsolidationConfig()
 
     @model_validator(mode="after")
     def _check_compression(self):
@@ -133,6 +169,9 @@ class Config(_Strict):
                 and self.compression.keep_recent_user_turns >= self.proxy.trim_keep_user_turns):
             raise ValueError("compression.keep_recent_user_turns must be smaller than "
                              "proxy.trim_keep_user_turns, or compression would never apply")
+        if self.stable_memory.enabled and self.stable_memory.max_tokens >= self.memory.max_context_tokens:
+            raise ValueError("stable_memory.max_tokens must be smaller than memory.max_context_tokens "
+                             "(the base is part of that budget)")
         return self
     application: ApplicationConfig = ApplicationConfig()
 

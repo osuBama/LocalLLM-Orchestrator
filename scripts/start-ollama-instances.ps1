@@ -1,12 +1,15 @@
 <#
 .SYNOPSIS
-    Starts two Ollama servers, each pinned to one GPU.
-      Instance A (primary): RTX 5070        -> 127.0.0.1:11434
-      Instance B (memory) : RTX 2070 SUPER  -> 127.0.0.1:11435
+    Starts two Ollama servers, each pinned to one NVIDIA GPU.
+      Instance A (primary): the larger GPU  -> 127.0.0.1:11434
+      Instance B (memory) : the other GPU   -> 127.0.0.1:11435
 
 .DESCRIPTION
     GPUs are pinned by UUID (CUDA device indices do not reliably follow slot
-    order). By default the UUIDs are auto-detected from nvidia-smi by name.
+    order). Role selection, in order of precedence:
+      -PrimaryGpu / -MemoryGpu   explicit UUIDs (see -ListGpus)
+      -PrimaryMatch / -MemoryMatch   a substring of the GPU name, e.g. "4090"
+      neither: with exactly two GPUs, the one with more VRAM is primary.
 
     The Ollama tray app starts its own unpinned server on 11434. Quit it and
     disable its autostart first, or pass -Force to stop running Ollama processes.
@@ -21,14 +24,14 @@
 param(
     [string]$PrimaryGpu = "",              # UUID (GPU-xxxx...). Empty = auto-detect by -PrimaryMatch
     [string]$MemoryGpu  = "",
-    [string]$PrimaryMatch = "5070",
-    [string]$MemoryMatch  = "2070",
+    [string]$PrimaryMatch = "",            # e.g. "4070" - empty = choose by VRAM
+    [string]$MemoryMatch  = "",
     [int]$PrimaryPort = 11434,
     [int]$MemoryPort  = 11435,
     [int]$PrimaryContext = 16384,
     [int]$MemoryContext  = 8192,
-    [string]$ModelsDir = $env:OLLAMA_MODELS,   # e.g. G:\AI\models - shared by both instances
-    [string]$LogDir = "G:\AI\logs",
+    [string]$ModelsDir = $env:OLLAMA_MODELS,   # e.g. D:\AI\models - shared by both instances
+    [string]$LogDir = (Join-Path (Split-Path -Parent $PSScriptRoot) "logs"),
     [string]$KvCacheType = "q8_0",             # halves KV-cache VRAM vs f16; needs flash attention
     [switch]$ListGpus,
     [switch]$Status,
@@ -44,12 +47,23 @@ function Get-Gpus {
     if (-not $smi) { throw "nvidia-smi not found. Install/repair the NVIDIA driver." }
     & nvidia-smi --query-gpu=index,name,uuid,memory.total --format=csv,noheader | ForEach-Object {
         $p = $_.Split(",") | ForEach-Object { $_.Trim() }
-        [pscustomobject]@{ Index = $p[0]; Name = $p[1]; Uuid = $p[2]; Memory = $p[3] }
+        [pscustomobject]@{ Index = $p[0]; Name = $p[1]; Uuid = $p[2]; Memory = $p[3]
+                           MemoryMiB = [int]($p[3] -replace "[^0-9]", "") }
     }
 }
 
 function Resolve-Gpu([string]$uuid, [string]$match, $gpus, [string]$role) {
     if ($uuid) { return $uuid }
+    if (-not $match) {
+        if (@($gpus).Count -ne 2) {
+            throw "Found $(@($gpus).Count) GPUs; pass -PrimaryMatch/-MemoryMatch or -PrimaryGpu/-MemoryGpu (see -ListGpus)."
+        }
+        $sorted = @($gpus | Sort-Object MemoryMiB -Descending)
+        if ($sorted[0].MemoryMiB -eq $sorted[1].MemoryMiB) {
+            throw "Both GPUs have the same VRAM; choose roles with -PrimaryMatch/-MemoryMatch or UUIDs."
+        }
+        return $(if ($role -eq "Primary") { $sorted[0].Uuid } else { $sorted[1].Uuid })
+    }
     $hits = @($gpus | Where-Object { $_.Name -match $match })
     if ($hits.Count -ne 1) {
         throw "Could not uniquely find the $role GPU matching '$match'. Pass -$($role)Gpu <UUID> (see -ListGpus)."
