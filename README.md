@@ -1,300 +1,380 @@
-# Local AI Orchestrator — dual-GPU external memory
+# Local AI Orchestrator: dual-GPU external memory
 
-Implementation of `local_ai_dual_gpu_memory_build_spec.md`, **Phases 1 and 2**, adapted to:
+Run two local LLMs on two GPUs as one system:
 
-| | Spec assumed | This build |
-|---|---|---|
-| Primary GPU | RTX 5070 Ti 16 GB | **RTX 5070 12 GB** |
-| Memory GPU | RTX 2070 SUPER 8 GB | RTX 2070 SUPER 8 GB |
-| System RAM | — | 16 GB DDR4 |
-| Front end | orchestrator's own API | **OpenClaw (WSL)** via an Ollama-compatible proxy, plus the spec's `/chat` API |
+- **GPU A, the primary model**, does the actual work: chat, coding, agent tool calls.
+- **GPU B, the memory model**, works in the background. It maintains a persistent project
+  memory, rolling session summaries and digests of large tool output, so the primary gets the
+  context it needs in far fewer tokens.
 
 ```
-OpenClaw (WSL) ──► 127.0.0.1:8000  orchestrator  ──► 11434  Ollama A  RTX 5070       qwen3:14b
-   ai chat     ──►   ├ injects <PROJECT_MEMORY>
-                     ├ logs raw JSONL
-                     └ queues finished turns ──► worker ──► 11435  Ollama B  RTX 2070 SUPER  qwen3:8b
-                                                    └► validator ─► Markdown (canonical) + SQLite (index)
+your client ──► 127.0.0.1:8000  orchestrator ──► Ollama A (GPU A)  primary model
+(OpenClaw, ai chat,     ├ injects relevant memory + session summary
+ any Ollama client)     ├ trims old history / compresses old tool output (cache-friendly)
+                        ├ strips the primary's <memory_flag> hints
+                        └ queues finished turns ──► worker ──► Ollama B (GPU B)  memory model
+                                                      └► validator ─► Markdown memory + SQLite
 ```
 
-Copy this folder so that it **is** `G:\AI` (so `G:\AI\app`, `G:\AI\config`, `G:\AI\memory`, ...).
-Everything else (paths, models, ports, budgets) is in `config\config.yaml`.
+To your client, the orchestrator looks like a normal Ollama server. Everything is local; nothing
+leaves the machine.
+
+**Contents:** 1 Requirements · 2 Plan your setup · 3 Install · 4 Start two pinned Ollama instances ·
+5 Configure · 6 Start and verify · 7 Connect a client · 8 Tune for your VRAM · 9 How it works ·
+10 CLI and API · 11 Measure · 12 Troubleshooting · 13 Limitations
 
 ---
 
-## 1. Hardware checks before installing the 2070 SUPER
+## 1. Requirements
 
-- **PSU**: RTX 5070 ≈ 250 W + RTX 2070 SUPER ≈ 215 W, plus CPU. Aim for a quality 850 W unit, with separate PCIe power cables per card (no daisy-chained pigtails).
-- **Slot**: the second card can sit in an x4-electrical slot; inference barely touches PCIe once a model is loaded.
-- **Driver**: one current NVIDIA driver covers both Blackwell and Turing. After installing, `nvidia-smi -L` must list both cards.
-- **Ollama**: the 5070 needs a recent Ollama build (Blackwell/CUDA 12.8 support).
+- **Two GPUs**, any combination that Ollama supports. The included launcher script is for
+  **Windows + NVIDIA**. Linux and AMD work too, with the manual commands in §4.
+- **Ollama**, recent enough for both of your cards. New GPU generations need recent builds.
+- **Python 3.11+**.
+- Enough **PSU** headroom for both cards at full load, with separate PCIe power cables per card.
+  Check both cards' rated board power plus your CPU.
+- The second card can sit in an x4-electrical slot. Inference barely uses PCIe once a model is loaded.
 
-## 2. Install
+One GPU also works (see §4.4), just without the isolation benefits.
 
-Requires Python 3.11+ on Windows.
+## 2. Plan your setup
 
+### 2.1 Which GPU does what
+
+| Role | Give it | Why |
+|---|---|---|
+| Primary | The GPU with **more VRAM** (if equal, the faster one) | Answer quality and speed come from here |
+| Memory | The other GPU | Its work happens in the background, so it can be older or slower |
+
+The memory GPU needs to be good at following instructions and producing JSON, not at deep reasoning.
+
+### 2.2 Sizing models to VRAM
+
+Every model must fit **entirely** on its GPU. With partial CPU offload, performance collapses.
+Rough rules for Q4_K_M quantization:
+
+- **Weights** ≈ 0.6 GB per billion parameters (8B ≈ 5 GB, 14B ≈ 9 GB, 32B ≈ 20 GB).
+- **KV cache** (the context) with `q8_0` cache type ≈ 0.04–0.1 GB per 1,000 tokens for 7–14B models.
+  It is roughly double that with the default f16 cache.
+- **Overhead** ≈ 0.5–1 GB. If the GPU also drives your monitors, subtract what the desktop uses
+  (check `nvidia-smi` at idle).
+
+Starting points (verify with §6; the measurement wins over this table):
+
+| GPU VRAM | Primary model (num_ctx) | Memory model (num_ctx) |
+|---|---|---|
+| 4–6 GB | not recommended | `qwen3:4b` (4k–8k) or `qwen3:1.7b` |
+| 8 GB | `qwen3:8b` (8k) | `qwen3:8b` (8k) |
+| 12 GB | `qwen3:14b` (16k) | `qwen3:8b` (16k) |
+| 16 GB | `qwen3:14b` (32k) | `qwen3:14b` (8k) |
+| 24 GB | `qwen3:32b` (8k–16k) or `qwen3:14b` (64k) | overkill; consider giving it more work (§13) |
+
+Any Ollama model works; the Qwen3 family is just a consistent example. For the **memory** model,
+prefer models that handle structured output well. Smaller memory models produce more rejected
+changes; you can see that in `ai memory changes` (§11).
+
+## 3. Install
+
+Pick an install folder (examples use `D:\AI`; any path works). Copy this project so the folder
+contains `app\`, `config\`, `prompts\`, `scripts\`, `memory\`.
+
+**Windows:**
 ```powershell
-cd G:\AI
-powershell -ExecutionPolicy Bypass -File .\scripts\start-orchestrator.ps1 -Test   # creates .venv, installs, runs tests
+cd D:\AI
+powershell -ExecutionPolicy Bypass -File .\scripts\start-orchestrator.ps1 -Test
+```
+This creates `.venv`, installs dependencies and runs the test suite.
+
+**Linux:**
+```bash
+cd ~/ai
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements-dev.txt && python -m pytest -q
 ```
 
-## 3. Start the two pinned Ollama instances
+Then edit `config\config.yaml` and set `paths.root` to your install folder. Alternatively, set the
+`AI_ROOT` environment variable; `AI_CONFIG` points at an alternative config file.
 
-The Ollama tray app runs its own **unpinned** server on 11434. Quit it and disable its autostart
-(Task Manager → Startup apps), otherwise it grabs the port and both GPUs.
+**Seed memory:** `memory\*.md` ships with example entries describing one specific setup. Edit them
+to describe yours, or delete the `.md` files and they'll be recreated empty on first start.
+
+## 4. Start two pinned Ollama instances
+
+The idea: two `ollama serve` processes, each limited to one GPU and listening on its own port, and
+both reading the same models folder (weights are stored once).
+
+### 4.1 Windows + NVIDIA (script)
+
+First stop the Ollama tray app and disable its autostart (Task Manager → Startup apps). It runs its
+own unpinned server on port 11434, which would grab the port and both GPUs.
 
 ```powershell
-.\scripts\start-ollama-instances.ps1 -ListGpus          # shows names + UUIDs
-.\scripts\start-ollama-instances.ps1 -ModelsDir G:\AI\models   # or wherever your models already are
+.\scripts\start-ollama-instances.ps1 -ListGpus           # names, UUIDs, VRAM
+.\scripts\start-ollama-instances.ps1 -ModelsDir D:\AI\models
 ```
 
-The script auto-detects the GPUs by name ("5070" / "2070"), pins each instance with
-`CUDA_VISIBLE_DEVICES=<GPU UUID>` (indices are unreliable), and sets per instance:
-flash attention on, `OLLAMA_KV_CACHE_TYPE=q8_0`, `OLLAMA_NUM_PARALLEL=1`
-(each parallel slot costs a full KV cache), and a default context length. Both instances share one
-models folder, so weights are stored once.
+How roles are chosen: with exactly two GPUs of different VRAM, the **larger is primary** automatically.
+Otherwise pick them by name or UUID:
 
-Pull models once (either instance works, the folder is shared):
+```powershell
+.\scripts\start-ollama-instances.ps1 -PrimaryMatch "4070" -MemoryMatch "3060"
+.\scripts\start-ollama-instances.ps1 -PrimaryGpu GPU-1a2b... -MemoryGpu GPU-9f8e...
+```
 
+Other options: `-PrimaryPort/-MemoryPort` (11434/11435), `-PrimaryContext/-MemoryContext` (default
+context per instance), `-KvCacheType` (`q8_0`; use `f16` if a model misbehaves), `-LogDir`,
+`-Force` (stop running Ollama processes first), `-Status`, `-Stop`.
+
+Each instance gets: `CUDA_VISIBLE_DEVICES=<GPU UUID>` (UUIDs, because CUDA indices don't reliably
+follow slot order), flash attention on, `q8_0` KV cache, `OLLAMA_NUM_PARALLEL=1` (each parallel slot
+costs a full KV cache) and `OLLAMA_MAX_LOADED_MODELS=1`.
+
+### 4.2 Linux + NVIDIA (manual)
+
+```bash
+nvidia-smi -L                                   # get the UUIDs
+common="OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0 OLLAMA_NUM_PARALLEL=1 OLLAMA_MAX_LOADED_MODELS=1 OLLAMA_MODELS=/srv/ai/models"
+env $common CUDA_VISIBLE_DEVICES=GPU-aaaa OLLAMA_HOST=127.0.0.1:11434 OLLAMA_CONTEXT_LENGTH=16384 ollama serve &
+env $common CUDA_VISIBLE_DEVICES=GPU-bbbb OLLAMA_HOST=127.0.0.1:11435 OLLAMA_CONTEXT_LENGTH=8192  ollama serve &
+```
+
+To run them permanently, create two systemd services (or override the stock `ollama.service` for
+instance A and copy it as `ollama-memory.service` for B), each with those values as `Environment=`
+lines. Stop the stock service first if it isn't one of the two, since it binds 11434 unpinned.
+
+### 4.3 AMD
+
+Same idea, but Ollama selects AMD GPUs with `ROCR_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES` instead of
+`CUDA_VISIBLE_DEVICES`; see Ollama's GPU documentation for your platform. The Windows script is
+NVIDIA-only, so start the instances manually as in §4.2. Mixing an NVIDIA and an AMD card also works
+in principle, since each instance only needs its own GPU, but it is untested here.
+
+### 4.4 One GPU only
+
+Point both `ollama.primary.base_url` and `ollama.memory.base_url` at the same instance and set
+`OLLAMA_MAX_LOADED_MODELS=2` on it. Both models must fit in VRAM together, or Ollama will swap them
+in and out on every background task, which is very slow. A small memory model (`qwen3:1.7b`/`4b`)
+helps. `/health` will warn that there is no isolation.
+
+### 4.5 Pull models and verify pinning
+
+Pull once; both instances share the models folder:
 ```powershell
 $env:OLLAMA_HOST="127.0.0.1:11434"; ollama pull qwen3:14b; ollama pull qwen3:8b; Remove-Item Env:OLLAMA_HOST
 ```
+(Linux: `OLLAMA_HOST=127.0.0.1:11434 ollama pull ...`)
 
-Load one model on each and check pinning. **Both must show 100% GPU:**
+Load each model on its own instance, then check:
+```powershell
+$env:OLLAMA_HOST="127.0.0.1:11434"; ollama run qwen3:14b "hi"
+$env:OLLAMA_HOST="127.0.0.1:11435"; ollama run qwen3:8b "hi"; Remove-Item Env:OLLAMA_HOST
+.\scripts\start-ollama-instances.ps1 -Status        # Linux: OLLAMA_HOST=127.0.0.1:1143x ollama ps ; nvidia-smi
+```
+**Both models must show 100% GPU, and each on the GPU you intended.** If not, lower that instance's
+context or pick a smaller model or quant (§2.2).
+
+## 5. Configure
+
+`config\config.yaml` controls everything. The settings you must check:
+
+| Setting | Set it to |
+|---|---|
+| `paths.root` | your install folder |
+| `ollama.primary.model` / `num_ctx` | your primary model and the context that fits (§2.2) |
+| `ollama.memory.model` / `num_ctx` | your memory model and its context |
+| `ollama.*.base_url` | your two instances' ports |
+| `ollama.memory.think` | `false` for models with a thinking mode (faster, cleaner JSON); remove for others |
+| `memory.max_context_tokens` | ~15% of the primary's `num_ctx` (2,500 at 16k) |
+
+Everything else has working defaults; §8 explains when to change them.
+
+## 6. Start and verify
 
 ```powershell
-$env:OLLAMA_HOST="127.0.0.1:11434"; ollama run qwen3:14b "hi" --verbose
-$env:OLLAMA_HOST="127.0.0.1:11435"; ollama run qwen3:8b "hi" --verbose; Remove-Item Env:OLLAMA_HOST
-.\scripts\start-ollama-instances.ps1 -Status
+.\scripts\start-orchestrator.ps1        # Linux: python -m app.main
+.\ai status                             # Linux: python -m app.cli status
+.\ai chat -v
 ```
 
-Until the 2070 SUPER is installed, point `ollama.memory.base_url` at `http://127.0.0.1:11434` and
-consider `qwen3:4b` as the memory model. `/health` will then warn that there is no GPU isolation.
+`ai status` shows both instances, whether each loaded model is 100% on GPU, the background queue and
+memory-file health. `ai chat -v` shows which memory entries were injected for each message.
 
-## 4. Start the orchestrator
+The orchestrator listens on `127.0.0.1:8000` and has no authentication. Don't expose it to your LAN.
 
-```powershell
-.\scripts\start-orchestrator.ps1
-.\ai status          # both instances, GPU residency, queue, memory file health
-.\ai chat -v         # talk through /chat; -v shows which memory entries were injected
-```
+## 7. Connect a client
 
-## 5. Connect OpenClaw (WSL)
+### 7.1 Any Ollama-native client
 
-1. Copy `examples\wslconfig.example` to `%UserProfile%\.wslconfig` and run `wsl --shutdown`.
-   Mirrored networking lets WSL reach `127.0.0.1:8000` on Windows, so the orchestrator never has to
-   listen on a LAN-facing address. This also caps WSL's RAM, which matters with 16 GB total.
-2. Merge `examples\openclaw-provider.json5` into `~/.openclaw/openclaw.json` in the distro and run
-   `openclaw gateway restart`. Check it against your OpenClaw version's Ollama provider docs.
-   **Keep `api: "ollama"`**: memory is only injected on the native `/api/chat` route. `/v1/*` is
-   passed through untouched.
-3. From WSL: `curl http://127.0.0.1:8000/api/tags` should list the primary instance's models.
+Point the client's Ollama URL at `http://127.0.0.1:8000` instead of `:11434`. It will list the primary
+instance's models and chat as usual, with memory added automatically.
 
-What the proxy does to each `/api/chat` request:
+Memory only works on Ollama's **native** `/api/chat` endpoint. Clients that use the OpenAI-compatible
+`/v1` endpoints are passed through **without** memory. If a client offers both, choose "Ollama".
 
-- Trims old history **in steps** (§6b) and puts the session summary in its place.
-- Wraps the **latest** user message as `<PROJECT_MEMORY>…</PROJECT_MEMORY>` + `<USER_REQUEST>…</USER_REQUEST>`.
-  Earlier history is left byte-identical, so Ollama's prompt cache keeps hitting on the history prefix.
-  The same memory block is reused for every tool-call round trip of one turn, for the same reason.
-- Appends `prompts\primary_system.txt` to OpenClaw's system prompt (`proxy.append_system_prompt`).
-- Sets `options.num_ctx` from config if OpenClaw didn't.
-- Streams the response through with tool calls intact, removing the primary's `<memory_flag>` tags (§6a).
-  When flags are disabled, chunks are relayed byte-for-byte.
-- When the model's reply has **no** pending tool calls, the turn is over. It is written to JSONL
-  (user message, tool calls, tool results, answer, flags) and two tasks are queued: a session-summary
-  update (high priority) and memory extraction (if flagged or triggered). Intermediate tool steps are
-  not queued separately; flags raised during them are carried to the end of the turn.
+Conversation ids: native requests don't carry one, so the orchestrator derives one from the model and
+the first user message. Clients that can send an `X-Conversation-Id` header get exact session tracking.
 
-Conversation ids: OpenClaw doesn't send one, so the proxy derives `oc-<hash>` from the model and the
-first user message. Send an `X-Conversation-Id` header if you have a better id.
+### 7.2 OpenClaw
 
-OpenClaw's own background calls (for example compaction summaries) also pass through `/api/chat`.
-They get memory injected and are logged like any other turn; the memory model usually returns no changes for them.
+Merge `examples\openclaw-provider.json5` into `~/.openclaw/openclaw.json`, set your model id and
+`contextWindow` (equal to `ollama.primary.num_ctx`), then run `openclaw gateway restart`. Keep
+`api: "ollama"`. Check the snippet against your OpenClaw version's provider docs.
 
-## 6a. Memory flags (primary → helper)
+### 7.3 Clients inside WSL
 
-The primary is told to end a reply with up to three lines like
+To reach `127.0.0.1:8000` on Windows from WSL, copy `examples\wslconfig.example` to
+`%UserProfile%\.wslconfig` (mirrored networking, plus a RAM cap so WSL doesn't take half your memory)
+and run `wsl --shutdown`.
+
+### 7.4 Your own code
 
 ```
-<memory_flag category="lesson">MCP route is /mcp, not /sse</memory_flag>
+POST http://127.0.0.1:8000/chat   {"conversation_id": "optional", "message": "..."}
 ```
+This returns the answer, the conversation id and which memory entries were used. It keeps the last
+`conversation.recent_turns` exchanges verbatim and lets memory and the session summary carry the rest.
 
-when the turn produced something durable (`prompts\primary_flags.txt`). The proxy strips them from
-the stream before OpenClaw sees them. Tags split across chunks at any character are handled, and only
-the few characters that could still be the start of a tag are held back. Then:
+## 8. Tune for your VRAM
 
-- A flagged turn **always** goes to the memory model, even if the regex heuristics would skip it.
-- The flags go to the memory model as *hints to verify*, not facts. The extractor still writes the
-  entry itself and the validator still applies every rule, because flag text is model output.
-- The heuristics stay on as a fallback for turns the primary forgets to flag.
+All context-saving features are on by default and scale with your settings.
 
-This costs ~20–50 generated tokens on turns that flag something and nothing on the rest. Disable it
-with `flags.enabled: false`. To judge whether flags help, look at `memory_flags` per request in
-`/metrics` and at what lands in `ai memory changes`.
+| Feature | Settings | Rule of thumb |
+|---|---|---|
+| Memory injection | `memory.max_context_tokens` | ~15% of primary `num_ctx`. Clients with large system prompts or many tools (agents) need more free room. |
+| Stepped history trimming | `proxy.trim_trigger_user_turns` / `trim_keep_user_turns` | Small context (8–16k): 10 / 4. Large context (32k+): 20 / 8, or `0` to disable. |
+| Tool-output compression | `compression.min_result_tokens`, `keep_recent_user_turns`, `digest_max_tokens` | Defaults suit most setups. `keep_recent` must be smaller than `trim_keep`. |
+| Session summaries | `session.summary_max_tokens` | 400; raise it if long sessions lose details. |
+| Memory flags | `flags.enabled` | On; costs the primary ~20–50 tokens only on turns that flag something. |
 
-## 6b. Session summaries and stepped trimming
+If `ai status` ever shows less than 100% GPU, **lower `num_ctx` first**. Keep the client's own
+context-window setting (e.g. OpenClaw `contextWindow`) equal to `ollama.primary.num_ctx`.
 
-After every finished turn the memory model updates a rolling summary of that conversation: goal,
-what was tried, what worked or failed, specifics, next steps. It's capped at `session.summary_max_tokens`.
-Summaries are stored in SQLite, only move forward (a late retry can never overwrite a newer one),
-and jump the queue ahead of extraction so they are ready for your next prompt.
-Read them with `ai memory sessions`.
+## 9. How it works
 
-Once OpenClaw's history exceeds `proxy.trim_trigger_user_turns` (10), the proxy drops the oldest
-user turns in steps back to about `trim_keep_user_turns` (4). The summary goes into the memory block as
-`SESSION SO FAR`, taking at most half the memory budget so durable memory always keeps room.
+### 9.1 Per request (`/api/chat`)
 
-- **Why steps:** with trigger 10 / keep 4 the cut point is fixed for 5–6 turns at a time
-  (turns 11–15 drop 6, 16–21 drop 12, …). In between cuts the prompt prefix is identical and Ollama's
-  cache hits; only the turn where the cut moves pays a full prefill.
-- **Safety:** with `trim_requires_summary: true`, turns the summary hasn't covered yet are never
-  cut. If the helper lags or is down, history simply isn't trimmed until it catches up.
-- **Stable within a turn:** the trim point, memory block and summary are fixed at the first request
-  of a turn and reused for every tool-call round trip, even if a summary update lands mid-turn.
-- Cuts only happen at user-message boundaries, so tool-call chains are never split.
-- OpenClaw keeps its full history on its side; only what is sent to the model is trimmed.
+1. The turn plan is fixed once per user turn and reused for every tool-call round trip: the trim
+   point, which old tool results become digests, and the memory block.
+2. Old history is trimmed in steps, and old large tool results are swapped for digests (§9.4).
+3. Relevant memory and the session summary are wrapped as `<PROJECT_MEMORY>…</PROJECT_MEMORY>` in
+   the **latest** user message, so earlier history stays byte-identical and Ollama's prompt cache
+   keeps hitting.
+4. `prompts\primary_system.txt` (and the flag instruction) is appended to the client's system prompt,
+   and `num_ctx` is set if the client didn't.
+5. The reply streams back with tool calls intact and `<memory_flag>` tags removed.
+6. When the reply has no pending tool calls, the turn is over. It is written to raw JSONL, and the
+   background queue gets, in priority order: the session-summary update, digests for large tool
+   results, and memory extraction (if the turn was flagged or matched the trigger heuristics).
 
-Set `trim_trigger_user_turns: 0` to turn trimming off. Compare `prompt_tokens`, `prefill_time` and
-`user_turns_dropped` in `/metrics` with it on and off.
+### 9.2 Persistent memory
 
-## 6c. Tool-result compression
-
-In agent sessions the context fills with tool output (file dumps, logs, command output), and all of it
-is re-sent on every request. After each turn, the memory model writes a short digest of every tool result
-over `compression.min_result_tokens` (400). Digests are stored by content hash, so the same output
-is never digested twice. When the primary is called, results from **older** turns are sent as:
-
-```
-[compressed tool output: original ~1840 tokens; re-run the tool if exact output is needed]
-- contents of app/config.py, 180 lines; pydantic models PathsConfig, OllamaEndpoint, ...
-```
-
-Accuracy safeguards:
-- Results from the current turn and the last `keep_recent_user_turns` (2) are never touched.
-- A result is only replaced once its digest exists. If the helper is behind, it stays verbatim.
-- A digest is **unusable** if the helper overshot the length limit (nothing gets cut off arbitrarily)
-  or if it doesn't save at least half. Those results stay verbatim.
-- The digest prompt keeps error messages, paths, names, versions, ports and IDs verbatim, and the
-  marker tells the model it can re-run the tool if it needs exact output.
-- `never_compress_tools` keeps specific tools' output verbatim, e.g. if you notice the model needing
-  old file contents exactly.
-
-Cache safeguards: the compression boundary moves on the **same turns as the trim point** (before trimming
-starts, every `step_turns`), so the cache is invalidated once per step, not twice. The set of results
-replaced is frozen when the boundary moves, so a digest finishing mid-window doesn't change the prefix.
-With the defaults, the boundary moves at turns 8, 11, 16, 22, …
-
-Measure it: `tool_results_compressed` and `tool_tokens_saved` per request in `/metrics`, and the
-`tool_digests` totals (usable vs not). If the model starts re-running tools it already ran, digests
-are dropping something it needs. Raise `digest_max_tokens` or exclude that tool.
-
-## 6. Fitting a 12 GB card
-
-qwen3:14b Q4_K_M is roughly 9 GB of weights. With a q8_0 KV cache, 16k context adds roughly
-1.3 GB, which leaves little headroom. Hence:
-
-- `ollama.primary.num_ctx: 16384`, and OpenClaw's `contextWindow` set to the same value.
-- `memory.max_context_tokens: 2500` (the spec's 6000 assumed 16 GB). OpenClaw's own system prompt
-  and tool schemas already take a few thousand tokens.
-- Stepped trimming (§6b) keeps OpenClaw's history from filling the window in long sessions.
-- If `ai status` reports anything under 100% GPU, lower `num_ctx` before anything else.
-- There is an OpenClaw issue report (#65465) of its context precheck using a 16384-token reserve
-  regardless of config. If OpenClaw compacts constantly or refuses requests at a 16k window, that is
-  the first thing to check.
-
-To compare with and without memory (spec §35), run the same session with `proxy.inject_memory`
-on and off and compare `prompt_tokens`, `prefill_time` and `time_to_first_token` in `GET /metrics`.
-
-## 7. Memory
-
-`memory\*.md` is canonical and human-editable. Entries look like:
+`memory\*.md` holds one file per category: STATE, OBJECTIVES, CONSTRAINTS, DECISIONS, LESSONS,
+DISCOVERIES, ENVIRONMENT. Each entry has a stable id:
 
 ```markdown
 ### L-003 — HTTP 404 debugging
-<!-- meta: status=active created=... updated=... source=oc-... -->
+<!-- meta: status=active created=... updated=... source=... -->
 A successful HTTP connection does not prove the requested endpoint exists.
 ```
 
-You can edit entry text freely; keep the `###` heading and the meta line. The store **refuses to
-rewrite** a file containing sections it doesn't manage, rather than silently dropping your text.
-`ai memory validate` tells you what is wrong. Every write is: backup to `memory\history\` → render →
-re-parse and verify → write temp → fsync → atomic replace.
+- You can edit entry text by hand; keep the `###` heading and the meta line. The store refuses to
+  rewrite a file with sections it doesn't recognise rather than lose your text. `ai memory validate`
+  tells you what is wrong.
+- Every write is: backup to `memory\history\` → re-parse and verify → atomic replace.
+- The memory model only **proposes** changes, as JSON constrained by Ollama's structured output. A
+  validator treats that output as untrusted. It rejects bad schemas, path-like titles, prompt-injection
+  phrasing, dangerous commands and anything that looks like a secret, and it dedupes against existing
+  memory. Every proposal, including rejections and the reason, is logged in SQLite.
+- Raw conversation history (`conversations\*.jsonl`) is never deleted, so memory can always be rebuilt
+  from it (`ai memory rebuild --replay`).
 
-The seed files describe this setup (hardware, constraints, OpenClaw decision). Edit them to taste.
+### 9.3 Memory flags
 
-How updates flow:
+The primary is told to end a reply with up to three lines like
+`<memory_flag category="lesson">MCP route is /mcp, not /sse</memory_flag>` when something durable
+happened. They are stripped from the stream (even when split across chunks), always trigger
+extraction, and reach the memory model as hints to verify. Keyword heuristics (English + Portuguese)
+remain as a fallback for turns the primary forgets to flag.
 
-1. A finished turn passes the trigger heuristics (English + Portuguese: corrections, errors,
-   successes, config changes, decisions, tool use, …). Otherwise it is recorded as `skipped`.
-   Set `memory.trigger_mode: always` to send everything.
-2. The task is persisted in SQLite (`memory_tasks`), so queued work survives restarts. It is
-   processed one at a time and retried with exponential backoff up to `max_attempts`.
-3. qwen3:8b is called with Ollama **structured outputs** (the change schema is passed as `format`)
-   and thinking off, so it is constrained to valid JSON.
-4. The validator treats the output as hostile. It rejects: invalid JSON (no code-fence stripping or
-   repair), unknown fields, categories and operations; empty, oversized or low-confidence entries;
-   path-like titles and path traversal; prompt-injection phrasing and delimiter tags; dangerous
-   commands (`rm -rf`, `iex`, encoded PowerShell, …; ordinary commands like `nvidia-smi -L` are
-   allowed as facts); and anything that looks like a secret. It also dedupes against existing memory:
-   same title → update, near-identical content → reject, update of a missing entry → add.
-5. Accepted changes go to Markdown and are mirrored to SQLite. Every proposal, including rejected
-   ones and the reason, is kept in `memory_changes`.
+### 9.4 Session summaries, trimming and compression
 
-## 8. CLI and API
+- **Session summary:** after every turn the memory model updates a rolling summary of that
+  conversation. Summaries only move forward (a late retry can't overwrite a newer one).
+- **Stepped trimming:** past `trim_trigger_user_turns`, the oldest turns are cut back to about
+  `trim_keep_user_turns`, and the summary is injected as `SESSION SO FAR`. The cut point moves in steps
+  (with 10/4: turns 11, 16, 22, …), so the prompt prefix stays identical in between and the cache hits.
+  Turns the summary doesn't cover yet are never cut.
+- **Tool-output compression:** large tool results from older turns are replaced by digests labelled
+  `[compressed tool output: original ~N tokens; re-run the tool if exact output is needed]`. The
+  current turn and the last `keep_recent_user_turns` are never touched. A digest is only used if it
+  exists, respected its length limit and saves at least half. The boundary moves on the same turns as
+  the trim point, and the set of compressed results is frozen in between.
+- Cuts only happen at user-message boundaries, so tool-call chains are never split. The client keeps its
+  full history on its side; only what is sent to the model shrinks.
+
+## 10. CLI and API
+
+`ai` is `ai.cmd` on Windows and `python -m app.cli` on Linux.
 
 ```
-ai serve | chat | status | metrics
-ai memory show [category] | search "MCP 404" | context "prompt" | changes | tasks | sessions
+ai serve | chat [-v] | status | metrics
+ai memory show [category] | search "text" | context "prompt" | changes | tasks | sessions
 ai memory validate | backup | rebuild [--replay [--reset]] | consolidate
 ```
 
-`rebuild` alone rebuilds SQLite from Markdown. `--replay` re-queues every turn from the raw JSONL,
-and `--reset` starts from empty memory files first. All of them take a snapshot to
-`backups\YYYY-MM-DD_HH-MM-SS\` beforehand. Stop the server first, or use the API endpoint, so the
-CLI and the server don't write at the same moment.
+`ai memory context "prompt"` shows exactly what would be injected for a prompt. `rebuild` alone
+rebuilds SQLite from the Markdown; `--replay` re-queues all raw history through the memory model;
+`--reset` starts from empty memory first. A snapshot to `backups\` is always taken beforehand. Stop the
+server (or use the API) before CLI rebuilds.
 
 | Method | Path | |
 |---|---|---|
-| POST | `/chat` | `{"conversation_id"?, "message"}` → `{"conversation_id","response","memory_update_queued",…}` |
-| GET | `/health` | both instances, GPU %, worker, queue, memory-file health, isolation warnings |
-| GET | `/memory/state` | STATE entries + Markdown |
-| GET | `/memory/search?q=` | keyword search |
-| GET | `/memory/context?q=` | exact block that would be injected, with token estimate |
-| GET | `/memory/changes`, `/memory/tasks` | audit trail and queue |
-| GET | `/memory/sessions` | rolling session summaries |
-| POST | `/memory/rebuild` | `{"replay": false, "reset": false}` |
-| POST | `/memory/backup` | snapshot |
-| POST | `/memory/consolidate` | 501, Phase 4 |
-| GET | `/metrics` | tokens, prefill/generation time, TTFT, tok/s, memory update time |
-| * | `/api/*`, `/v1/*`, `/` | Ollama passthrough to the primary instance (only `/api/chat` gets memory) |
+| POST | `/chat` | spec API (§7.4) |
+| GET | `/health` | both instances, GPU %, worker, queue, memory-file health, warnings |
+| GET | `/metrics` | per-request tokens, prefill/generation time, TTFT, tok/s, trimming/compression savings |
+| GET | `/memory/state`, `/memory/search?q=`, `/memory/context?q=` | inspect memory |
+| GET | `/memory/changes`, `/memory/tasks`, `/memory/sessions` | audit trail, queue, summaries |
+| POST | `/memory/rebuild`, `/memory/backup` | maintenance |
+| POST | `/memory/consolidate` | not implemented yet (501) |
+| * | `/api/*`, `/v1/*`, `/` | passthrough to the primary instance (memory only on `/api/chat`) |
 
-Logs are JSON lines in `logs\orchestrator.log`, `primary.log` and `memory.log`. Ollama's own logs
-are in `logs\ollama-primary.log` and `logs\ollama-memory.log`.
+Logs: `logs\orchestrator.log`, `primary.log`, `memory.log` (JSON lines), plus each Ollama
+instance's log when started by the script.
 
-## 9. Differences from the spec
+## 11. Measure
 
-- **Defaults tuned for 12 GB**: see §6 above.
-- **Added**: primary-model memory flags, session summaries, stepped trimming and tool-result compression (§6a–§6c); the Ollama-compatible proxy for OpenClaw; `/memory/context`, `/memory/changes`,
-  `/memory/tasks`, `/memory/backup`; a persistent task table; secret rejection; Portuguese trigger
-  keywords; `conversation.recent_turns` (the last 2 exchanges go verbatim with `/chat`, so
-  follow-ups like "and the other one?" still work before memory catches up).
-- **Where memory goes**: into the latest user message, not the system prompt, to preserve prompt
-  caching. The injection-resistance instructions are in the system prompt.
-- **Markdown format**: entries carry stable ids, so updates are deterministic. The spec's free-form
-  examples (e.g. `## Current Environment` in STATE.md) are expressed as entries.
-- **Tokens** are estimated at ~3.5 characters per token. This is conservative, so the budget errs small.
-- **Not built yet**: Phase 3 (embeddings/vector retrieval: `MemoryRetriever` is the interface to
-  implement), Phase 4 (consolidation, automatic conflict resolution beyond update/deactivate,
-  context compression), and multi-project namespaces. The schema already has `project_id` columns
-  for those.
+Every feature can be switched off in `config.yaml`. Compare runs of the same kind of session with a
+feature on and off in `/metrics`: `prompt_tokens` (tokens Ollama actually had to process; cache hits
+lower it), `prefill_time`, `time_to_first_token`, `memory_tokens`, `user_turns_dropped`,
+`tool_tokens_saved`, `memory_flags`.
 
-## 10. Tests
+Quality signals worth checking weekly:
+- `ai memory changes`: a high rejection rate means the memory model is too small or confused.
+- `ai memory sessions`: whether summaries keep the specifics you care about.
+- Whether the primary re-runs tools it already ran. If so, digests are dropping something; raise
+  `digest_max_tokens` or add the tool to `never_compress_tools`.
 
-`.\scripts\start-orchestrator.ps1 -Test` runs 86 tests against fake Ollama instances: validator
-rejections, atomic writes and recovery, JSONL ordering/Unicode/1 MB messages, budget and priority,
-client timeout/connection/malformed handling, worker success/retry/failure/parse errors, proxy
-streaming and the tool-call loop, flag stripping split at every character, stepped trimming and
-prompt-prefix stability, summary priority and staleness, compression boundary schedule, frozen digest
-sets, unusable-digest fallback, and an end-to-end check that a fact learned in one turn is
-injected into a later one. Real-GPU behaviour (pinning, VRAM fit, qwen3:8b's JSON quality) can only be
-verified on your machine.
+## 12. Troubleshooting
+
+| Symptom | Likely cause / fix |
+|---|---|
+| Port 11434 already in use | The Ollama tray app or the stock service is running; stop it, or use `-Force` |
+| A model is under 100% GPU | Context too large for the VRAM: lower `num_ctx`, use `q8_0` KV cache or a smaller model |
+| Both models on the same GPU | Instances not pinned. Check `-Status` / `nvidia-smi`, and pin by UUID |
+| Client works but no memory appears | Client uses `/v1` (OpenAI mode); switch it to the Ollama provider |
+| Client in WSL can't reach :8000 | Mirrored networking not enabled (§7.3) |
+| Memory changes are mostly rejected | Memory model too small or thinking mode on; set `think: false` or try a larger model |
+| `memory file errors` in status | A hand edit broke the format; run `ai memory validate` and fix the reported line |
+| History never gets trimmed | The summary isn't keeping up (check `ai memory tasks`), or `trim_trigger_user_turns: 0` |
+| Client compacts or refuses at small context | Its own context precheck; raise `num_ctx` and the client's context window together if VRAM allows |
+
+## 13. Limitations and ideas
+
+- **Not built yet:** embedding-based retrieval (keyword search is used; `MemoryRetriever` is the
+  interface to implement), memory consolidation, multi-project namespaces (the schema already has
+  `project_id`), and an evaluation harness that replays sessions with features on and off.
+- A large second GPU could take on more: embeddings, a bigger memory model, or splitting one large
+  primary model across both cards instead. That trades the memory system for raw model size.
+- Tested with fake Ollama instances (86 tests: validator, atomic writes, streaming, flag stripping,
+  trimming and compression cache stability, retries…). Real-GPU behaviour (pinning, VRAM fit, a given
+  model's JSON quality) can only be verified on your machine (§4.5, §11).
