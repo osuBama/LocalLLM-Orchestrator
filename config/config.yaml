@@ -1,0 +1,95 @@
+# Local AI orchestrator configuration.
+# Relative paths are resolved against paths.root. The AI_ROOT environment
+# variable overrides paths.root; AI_CONFIG points at an alternative config file.
+
+paths:
+  root: "G:\\AI"
+  memory: "memory"
+  conversations: "conversations"
+  database: "database\\memory.db"
+  logs: "logs"
+  backups: "backups"
+  prompts: "prompts"
+
+ollama:
+  # Instance A: pinned to the RTX 5070 (12 GB) by scripts\start-ollama-instances.ps1
+  primary:
+    base_url: "http://127.0.0.1:11434"
+    model: "qwen3:14b"          # default for POST /chat; proxied requests keep their own model
+    timeout_seconds: 600
+    num_ctx: 16384              # ~9 GB weights + q8_0 KV cache fits a 12 GB card
+    keep_alive: "30m"
+
+  # Instance B: pinned to the RTX 2070 SUPER (8 GB)
+  memory:
+    base_url: "http://127.0.0.1:11435"
+    model: "qwen3:8b"
+    timeout_seconds: 600
+    num_ctx: 8192
+    keep_alive: "30m"
+    think: false                # qwen3 thinking off: faster, cleaner JSON
+
+memory:
+  project_id: "default"
+  max_context_tokens: 2500      # memory budget injected into the primary prompt
+  max_memory_file_tokens: 4000  # `ai memory validate` warns when a file grows past this
+  max_entry_tokens: 600         # single entries longer than this are truncated in context
+  enable_semantic_retrieval: false   # Phase 3
+  asynchronous_updates: true
+  create_backups: true
+  history_versions_per_file: 50
+  max_entry_chars: 1500
+  min_confidence: 0.6
+  trigger_mode: "heuristic"     # heuristic | always
+  extractor_memory_tokens: 1500
+  extractor_interaction_tokens: 3000
+  worker_enabled: true
+  worker_poll_seconds: 2
+  max_attempts: 5
+  retry_base_seconds: 30
+
+conversation:
+  retain_raw_history: true
+  format: "jsonl"
+  recent_turns: 2               # POST /chat only: last N exchanges sent verbatim alongside memory
+
+proxy:
+  # Ollama-compatible endpoint for OpenClaw (native API, /api/chat).
+  enabled: true
+  inject_memory: true
+  append_system_prompt: true    # appends prompts/primary_system.txt to the client's system prompt
+  queue_memory_updates: true
+  # Stepped trimming of OpenClaw's history. When it grows past 10 user turns it is cut
+  # back to ~4; the cut point then stays put for 5-6 turns so the prompt cache keeps hitting.
+  # The session summary + memory stand in for what was cut. 0 = never trim.
+  trim_trigger_user_turns: 10
+  trim_keep_user_turns: 4
+  trim_requires_summary: true   # never cut turns the session summary doesn't cover yet
+
+flags:
+  # The primary model ends replies with <memory_flag> tags for durable changes.
+  # The proxy strips them before the client sees them; they force and guide extraction.
+  enabled: true
+  max_per_turn: 3
+  max_chars: 300
+
+compression:
+  # Old tool results (file dumps, logs, command output) are replaced by short digests written
+  # by the memory model. Results from the last 2 user turns always stay verbatim, and the
+  # boundary moves only when the trim point moves, so the prompt cache keeps hitting.
+  enabled: true
+  keep_recent_user_turns: 2     # must be < proxy.trim_keep_user_turns
+  min_result_tokens: 400        # don't bother digesting small outputs
+  digest_max_tokens: 200
+  step_turns: 6                 # boundary schedule before trimming starts / with trimming off
+  never_compress_tools: []      # e.g. ["read_file"] to always keep a tool's output verbatim
+
+session:
+  # Rolling per-conversation summary kept by the memory model, injected once history is trimmed.
+  summaries_enabled: true
+  summary_max_tokens: 400
+
+application:
+  host: "127.0.0.1"
+  port: 8000
+  log_level: "INFO"

@@ -1,0 +1,11 @@
+Memory flags: when this turn established something durable that should outlive
+the conversation, end your reply with up to three lines of the form
+
+<memory_flag category="CATEGORY">one short factual sentence</memory_flag>
+
+CATEGORY is one of: state, objective, constraint, decision, lesson, discovery, environment.
+Flag only real, confirmed changes: a fix that worked, a cause found, a decision made,
+a configuration or environment change, a new constraint or preference, a goal
+reached or abandoned. Most turns need no flag; do not flag chit-chat, guesses or
+things you are unsure of. Flags are removed before the user sees your reply, so
+never refer to them in your answer.

@@ -1,0 +1,494 @@
+"""Ollama-compatible front door for OpenClaw (native API).
+
+OpenClaw's Ollama provider talks to /api/chat (streaming + tool calls) and
+discovers models via /api/tags and /api/show. Point its baseUrl here instead
+of at Ollama and this module:
+
+  1. injects the <PROJECT_MEMORY> block into the latest user message
+     (not the front of the conversation, so Ollama's prompt cache for the
+     history prefix survives between turns);
+  2. appends primary_system.txt to the client's system prompt;
+  3. trims old history in steps (proxy.trim_*), replacing what was cut with
+     the session summary kept by the memory model;
+  4. relays the response, streaming or not, tool calls intact, with the
+     primary's <memory_flag> tags stripped out;
+  5. when a turn ends (final answer, no pending tool calls) logs it to raw
+     JSONL and queues the summary update and memory extraction.
+
+Every other /api/* and /v1/* request is passed straight through to the
+primary instance. Only /api/chat gets memory.
+"""
+from __future__ import annotations
+
+import asyncio
+import copy
+from collections import OrderedDict
+from dataclasses import dataclass, field
+import hashlib
+import json
+import logging
+import time
+import uuid
+from typing import Any
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+from . import compression
+from .context_builder import BuiltContext, wrap_user_request
+from .flags import FlagStripper
+from .metrics import Metrics
+from .ollama_client import OllamaError
+from .orchestrator import Orchestrator
+from .util import estimate_tokens
+
+log = logging.getLogger("orchestrator")
+plog = logging.getLogger("primary")
+
+_HOP_HEADERS = {"host", "content-length", "connection", "keep-alive", "transfer-encoding",
+                "accept-encoding", "te", "trailer", "upgrade", "proxy-authorization"}
+_RESP_DROP = {"content-length", "transfer-encoding", "connection", "content-encoding"}
+
+
+def _fwd_headers(request: Request) -> dict[str, str]:
+    return {k: v for k, v in request.headers.items() if k.lower() not in _HOP_HEADERS}
+
+
+def _resp_headers(headers) -> dict[str, str]:
+    return {k: v for k, v in headers.items() if k.lower() not in _RESP_DROP}
+
+
+# --------------------------------------------------------------- helpers
+def last_user_index(messages: list[dict]) -> int | None:
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            return i
+    return None
+
+
+def conversation_id_for(request: Request, body: dict) -> str:
+    for h in ("x-conversation-id", "x-session-id"):
+        if request.headers.get(h):
+            return request.headers[h][:64]
+    first_user = next((m.get("content", "") for m in body.get("messages", [])
+                       if m.get("role") == "user" and isinstance(m.get("content"), str)), "")
+    digest = hashlib.sha1(f"{body.get('model', '')}\n{first_user[:4000]}".encode("utf-8")).hexdigest()
+    return "oc-" + digest[:14]
+
+
+def stepped_drop(user_turns: int, trigger: int, keep: int) -> int:
+    """How many leading user turns to drop.
+
+    Nothing until history exceeds `trigger`; then cut back to ~`keep`. The cut
+    point moves in steps of (trigger - keep), so for that many turns in a row
+    the prompt prefix is identical and Ollama's cache keeps hitting.
+    e.g. trigger=10 keep=4: turns 1-10 -> drop 0; 11-15 -> drop 6; 16-21 -> drop 12; 22-27 -> 18.
+    """
+    if trigger <= 0 or user_turns <= trigger:
+        return 0
+    step = trigger - keep
+    return ((user_turns - keep) // step) * step
+
+
+def drop_user_turns(messages: list[dict], drop: int) -> list[dict]:
+    """Remove the first `drop` user turns (and everything belonging to them).
+
+    Cutting only at user-message boundaries never splits a tool-call chain.
+    Leading system messages are always kept.
+    """
+    if drop <= 0:
+        return messages
+    user_idx = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+    if drop >= len(user_idx):
+        return messages
+    head = []
+    for m in messages:
+        if m.get("role") == "system":
+            head.append(m)
+        else:
+            break
+    return head + messages[user_idx[drop]:]
+
+
+def tool_events_since(messages: list[dict], start: int) -> list[dict]:
+    events: list[dict] = []
+    call_names: list[str] = []
+    for m in messages[start + 1:]:
+        role = m.get("role")
+        if role == "assistant":
+            for tc in m.get("tool_calls") or []:
+                fn = (tc or {}).get("function", {}) or {}
+                name = fn.get("name", "?")
+                call_names.append(name)
+                events.append({"type": "tool_call", "tool": name, "arguments": fn.get("arguments")})
+        elif role == "tool":
+            name = m.get("tool_name") or m.get("name") or (call_names.pop(0) if call_names else "?")
+            events.append({"type": "tool_result", "tool": name, "result": m.get("content", "")})
+    return events
+
+
+class _StreamAccumulator:
+    """Parses Ollama NDJSON as it streams; optionally strips memory flags.
+
+    Without a stripper, bytes are relayed exactly as received. With one, lines
+    carrying message.content are re-serialised with the flag text removed.
+    """
+
+    def __init__(self, stripper: FlagStripper | None = None):
+        self.stripper = stripper
+        self.buf = b""
+        self.content: list[str] = []
+        self.tool_calls: list[Any] = []
+        self.final: dict = {}
+        self.first_token_at: float | None = None
+        self.error: str | None = None
+
+    def feed(self, chunk: bytes, now: float) -> bytes:
+        self.buf += chunk
+        out: list[bytes] = []
+        while b"\n" in self.buf:
+            line, self.buf = self.buf.split(b"\n", 1)
+            out.append(self._line(line, now))
+        if self.stripper is None:
+            return chunk
+        return b"".join(out)
+
+    def close(self, now: float) -> bytes:
+        rest, self.buf = self.buf, b""
+        emitted = self._line(rest, now) if rest.strip() else b""
+        return b"" if self.stripper is None else emitted
+
+    def _line(self, line: bytes, now: float) -> bytes:
+        raw = line + b"\n"
+        if not line.strip():
+            return raw
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            return raw
+        if not isinstance(obj, dict):
+            return raw
+        if "error" in obj:
+            self.error = str(obj["error"])
+        msg = obj.get("message") or {}
+        content = msg.get("content") or ""
+        done = bool(obj.get("done"))
+        if self.stripper is not None:
+            visible = self.stripper.feed(content)
+            if done:
+                visible += self.stripper.finish()
+        else:
+            visible = content
+        if visible:
+            self.content.append(visible)
+            if self.first_token_at is None:
+                self.first_token_at = now
+        if msg.get("tool_calls"):
+            self.tool_calls.extend(msg["tool_calls"])
+            if self.first_token_at is None:
+                self.first_token_at = now
+        if done:
+            self.final = obj
+        if self.stripper is None or visible == content:
+            return raw
+        if not visible and not done and not msg.get("tool_calls") and not msg.get("thinking"):
+            return b""  # chunk was entirely flag text (or held back)
+        obj["message"] = {**msg, "content": visible}
+        return (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+@dataclass
+class TurnPlan:
+    """Decided once at the first request of a turn, reused for every tool-call step."""
+    drop: int
+    ctx: BuiltContext
+    summary_turns: int = 0
+    flags: list[dict] = field(default_factory=list)
+    boundary: int = 0                                   # tool results of turns <= this may be digests
+    frozen: dict[str, str] = field(default_factory=dict)  # result hash -> digest
+
+
+# ---------------------------------------------------------------- router
+def build_router(orch: Orchestrator) -> APIRouter:
+    router = APIRouter()
+    cfg = orch.config
+    plans: OrderedDict[tuple, TurnPlan] = OrderedDict()
+    layouts: OrderedDict[tuple, dict[str, str]] = OrderedDict()
+    never_tools = set(cfg.compression.never_compress_tools)
+
+    def new_stripper() -> FlagStripper | None:
+        if not cfg.flags.enabled:
+            return None
+        return FlagStripper(cfg.flags.max_per_turn, cfg.flags.max_chars)
+
+    def frozen_digests(conversation_id: str, drop: int, boundary: int,
+                       kept: list[dict]) -> dict[str, str]:
+        """Which results get digests is decided once per boundary position, then frozen."""
+        if boundary <= 0:
+            return {}
+        key = (conversation_id, drop, boundary)
+        if key in layouts:
+            layouts.move_to_end(key)
+            return layouts[key]
+        hashes = [h for _, h in compression.candidates(kept, drop + 1, boundary,
+                                                       cfg.compression.min_result_tokens, never_tools)]
+        found = orch.db.get_digests(hashes)
+        frozen = {h: d["digest"] for h, d in found.items() if d["usable"]}
+        layouts[key] = frozen
+        while len(layouts) > 256:
+            layouts.popitem(last=False)
+        return frozen
+
+    def plan_for(conversation_id: str, turn: int, user_text: str, original: list[dict]) -> TurnPlan:
+        key = (conversation_id, turn, hash(user_text))
+        if key in plans:
+            plans.move_to_end(key)
+            return plans[key]
+        drop = stepped_drop(turn, cfg.proxy.trim_trigger_user_turns, cfg.proxy.trim_keep_user_turns)
+        summary = orch.session_summary(conversation_id) if drop else None
+        covered = summary["covered_turns"] if summary else 0
+        if drop and cfg.proxy.trim_requires_summary and cfg.session.summaries_enabled:
+            drop = min(drop, covered)  # never cut what the summary doesn't cover yet
+        ctx = orch.context_builder.build(
+            user_text, session_summary=summary["summary"] if (drop and summary) else None) \
+            if cfg.proxy.inject_memory else BuiltContext("", 0)
+        plan = TurnPlan(drop, ctx, covered)
+        if cfg.compression.enabled:
+            plan.boundary = compression.compress_boundary(
+                turn, drop, trim_keep=cfg.proxy.trim_keep_user_turns,
+                keep_recent=cfg.compression.keep_recent_user_turns,
+                step=cfg.compression.step_turns, trimming=bool(cfg.proxy.trim_trigger_user_turns))
+            plan.frozen = frozen_digests(conversation_id, drop, plan.boundary,
+                                         drop_user_turns(original, drop))
+        plans[key] = plan
+        while len(plans) > 256:
+            plans.popitem(last=False)
+        return plan
+
+    def prepare(body: dict, conversation_id: str) -> tuple[dict, dict]:
+        """Return (outgoing body, info about the turn)."""
+        out = copy.deepcopy(body)
+        original: list[dict] = list(body.get("messages") or [])
+        info: dict[str, Any] = {"memory_tokens": 0, "memory_ids": [], "user_text": None,
+                                "user_index_original": None, "trimmed": 0, "turn": 0, "plan": None}
+        uidx = last_user_index(original)
+        user_text = original[uidx].get("content") if uidx is not None else None
+        messages = original
+        if isinstance(user_text, str):
+            turn = sum(1 for m in original if m.get("role") == "user")
+            plan = plan_for(conversation_id, turn, user_text, original)
+            info.update(user_text=user_text, user_index_original=uidx, turn=turn, plan=plan)
+            messages = drop_user_turns(original, plan.drop)
+            info["trimmed"] = len(original) - len(messages)
+            messages, n, saved = compression.apply(messages, plan.drop + 1, plan.boundary, plan.frozen,
+                                                   cfg.compression.min_result_tokens, never_tools)
+            info["tool_results_compressed"], info["tool_tokens_saved"] = n, saved
+        else:
+            messages = list(original)
+
+        if cfg.proxy.append_system_prompt:
+            if messages and messages[0].get("role") == "system" and isinstance(messages[0].get("content"), str):
+                messages[0] = {**messages[0],
+                               "content": messages[0]["content"].rstrip() + "\n\n" + orch.primary_system}
+            else:
+                messages.insert(0, {"role": "system", "content": orch.primary_system})
+
+        plan = info["plan"]
+        if plan is not None and plan.ctx.text:
+            idx = last_user_index(messages)
+            messages[idx] = {**messages[idx], "content": wrap_user_request(plan.ctx.text, user_text)}
+            info["memory_tokens"] = plan.ctx.token_estimate
+            info["memory_ids"] = plan.ctx.included
+        out["messages"] = messages
+
+        if orch.config.ollama.primary.num_ctx:
+            opts = dict(out.get("options") or {})
+            opts.setdefault("num_ctx", orch.config.ollama.primary.num_ctx)
+            out["options"] = opts
+        info["total_context_tokens"] = sum(
+            estimate_tokens(m.get("content", "")) for m in messages if isinstance(m.get("content"), str))
+        return out, info
+
+    async def finalize(body: dict, info: dict, conversation_id: str, request_id: str,
+                       content: str, tool_calls: list, final: dict, t0: float,
+                       first_token_at: float | None, error: str | None,
+                       stripper: FlagStripper | None) -> None:
+        plan: TurnPlan | None = info.get("plan")
+        if plan is not None and stripper is not None:
+            plan.flags.extend(f.to_dict() for f in stripper.flags)
+            plan.flags[:] = plan.flags[: cfg.flags.max_per_turn]
+        rec = {"request_id": request_id, "conversation_id": conversation_id, "mode": "proxy",
+               "primary_model": body.get("model"), "memory_model": cfg.ollama.memory.model,
+               "turn": info.get("turn"),
+               "memory_retrieval_count": len(info["memory_ids"]),
+               "memory_tokens": info["memory_tokens"],
+               "total_context_tokens": info["total_context_tokens"],
+               "history_messages_trimmed": info["trimmed"],
+               "user_turns_dropped": plan.drop if plan else 0,
+               "tool_results_compressed": info.get("tool_results_compressed", 0),
+               "tool_tokens_saved": info.get("tool_tokens_saved", 0),
+               "memory_flags": len(stripper.flags) if stripper else 0,
+               "tool_calls_in_response": len(tool_calls),
+               "total_request_time": round(time.perf_counter() - t0, 3)}
+        if first_token_at is not None:
+            rec["time_to_first_token"] = round(first_token_at - t0, 3)
+        rec.update(Metrics.from_ollama(final))
+        if error:
+            rec["error"] = error
+        orch.metrics.record_request(rec)
+        (plog.error if error else plog.info)("proxied chat", extra=rec)
+
+        if error:
+            orch.conv_log.system_event(conversation_id, "primary_failed", project_id=orch.project_id,
+                                       request_id=request_id, error=error,
+                                       user_message=info.get("user_text"))
+            return
+        if tool_calls or info.get("user_text") is None:
+            return  # mid-turn step: the model asked for tools; the turn is not over yet
+        original = body.get("messages") or []
+        uidx = info.get("user_index_original")
+        events = tool_events_since(original, uidx) if uidx is not None else []
+        try:
+            task = orch.record_turn(conversation_id=conversation_id, user_message=info["user_text"],
+                                    assistant_response=content, tool_events=events, source="openclaw",
+                                    flags=plan.flags if plan else [], turn_number=info.get("turn", 0))
+            if cfg.proxy.queue_memory_updates:
+                await orch.queue_memory(task)
+        except Exception:
+            log.exception("failed to record proxied turn", extra={"conversation_id": conversation_id})
+
+    @router.post("/api/chat")
+    async def api_chat(request: Request):
+        raw = await request.body()
+        try:
+            body = json.loads(raw or b"{}")
+        except json.JSONDecodeError:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        if not cfg.proxy.enabled or not isinstance(body, dict):
+            return await passthrough(request, "api/chat", raw)
+
+        request_id = uuid.uuid4().hex[:12]
+        conversation_id = conversation_id_for(request, body)
+        out, info = prepare(body, conversation_id)
+        stream = out.get("stream", True) is not False
+        t0 = time.perf_counter()
+        headers = {"content-type": "application/json"}
+        stripper = new_stripper()
+
+        if not stream:
+            try:
+                resp = await orch.primary.http.post("/api/chat", json=out, headers=headers)
+            except Exception as e:
+                await finalize(body, info, conversation_id, request_id, "", [], {}, t0, None, str(e), None)
+                return JSONResponse({"error": f"orchestrator: primary Ollama unreachable: {e}"},
+                                    status_code=502)
+            data: dict = {}
+            error = None
+            if resp.status_code >= 400:
+                error = f"HTTP {resp.status_code}: {resp.text[:300]}"
+            else:
+                try:
+                    data = resp.json()
+                except ValueError:
+                    error = "malformed JSON from primary"
+            msg = data.get("message") or {}
+            content = msg.get("content", "") or ""
+            changed = False
+            if stripper is not None and content and not error:
+                visible = stripper.feed(content) + stripper.finish()
+                if stripper.flags:
+                    visible = visible.rstrip()
+                if visible != content:
+                    content, changed = visible, True
+                    data["message"] = {**msg, "content": content}
+            await finalize(body, info, conversation_id, request_id, content,
+                           msg.get("tool_calls") or [], data, t0,
+                           time.perf_counter() if not error else None, error, stripper)
+            if changed:
+                return JSONResponse(data, status_code=resp.status_code)
+            return Response(resp.content, status_code=resp.status_code,
+                            headers=_resp_headers(resp.headers))
+
+        try:
+            upstream, body_iter = await orch.primary.stream_raw("POST", "/api/chat", json_body=out,
+                                                                headers=headers)
+        except OllamaError as e:
+            await finalize(body, info, conversation_id, request_id, "", [], {}, t0, None, str(e), None)
+            return JSONResponse({"error": f"orchestrator: primary Ollama unreachable: {e}"},
+                                status_code=502)
+
+        if upstream.status_code >= 400:
+            content = await upstream.aread()
+            await upstream.aclose()
+            await finalize(body, info, conversation_id, request_id, "", [], {}, t0, None,
+                           f"HTTP {upstream.status_code}: {content[:300]!r}", None)
+            return Response(content, status_code=upstream.status_code,
+                            headers=_resp_headers(upstream.headers))
+
+        acc = _StreamAccumulator(stripper)
+
+        async def relay():
+            completed = False
+            try:
+                async for chunk in body_iter:
+                    emitted = acc.feed(chunk, time.perf_counter())
+                    if emitted:
+                        yield emitted
+                tail = acc.close(time.perf_counter())
+                if tail:
+                    yield tail
+                completed = True
+            finally:
+                await upstream.aclose()
+                error = acc.error or (None if completed and acc.final else "stream ended early")
+                text = "".join(acc.content)
+                if stripper is not None and stripper.flags:
+                    text = text.rstrip()
+                # Shielded so a client disconnect cannot cancel logging/queuing.
+                await asyncio.shield(finalize(
+                    body, info, conversation_id, request_id, text, acc.tool_calls,
+                    acc.final, t0, acc.first_token_at, error, stripper))
+
+        return StreamingResponse(relay(), status_code=upstream.status_code,
+                                 media_type=upstream.headers.get("content-type", "application/x-ndjson"),
+                                 headers=_resp_headers({k: v for k, v in upstream.headers.items()
+                                                        if k.lower() != "content-type"}))
+
+    async def passthrough(request: Request, path: str, raw: bytes | None = None):
+        if raw is None:
+            raw = await request.body()
+        try:
+            upstream, body_iter = await orch.primary.stream_raw(
+                request.method, "/" + path, content=raw or None, headers=_fwd_headers(request),
+                params=list(request.query_params.multi_items()))
+        except OllamaError as e:
+            return JSONResponse({"error": f"orchestrator: primary Ollama unreachable: {e}"},
+                                status_code=502)
+
+        async def relay():
+            try:
+                async for chunk in body_iter:
+                    yield chunk
+            finally:
+                await upstream.aclose()
+
+        if request.method == "HEAD":
+            await upstream.aclose()
+            return Response(status_code=upstream.status_code, headers=_resp_headers(upstream.headers))
+        return StreamingResponse(relay(), status_code=upstream.status_code,
+                                 headers=_resp_headers(upstream.headers))
+
+    @router.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD"])
+    async def api_passthrough(path: str, request: Request):
+        return await passthrough(request, "api/" + path)
+
+    @router.api_route("/v1/{path:path}", methods=["GET", "POST", "HEAD"])
+    async def v1_passthrough(path: str, request: Request):
+        # OpenAI-compatible surface is passed through WITHOUT memory. Use api: "ollama" in OpenClaw.
+        return await passthrough(request, "v1/" + path)
+
+    @router.api_route("/", methods=["GET", "HEAD"])
+    async def root(request: Request):
+        return await passthrough(request, "")
+
+    return router

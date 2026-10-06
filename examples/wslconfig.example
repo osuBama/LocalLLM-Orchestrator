@@ -1,0 +1,8 @@
+# Copy to %UserProfile%\.wslconfig, then run `wsl --shutdown` from PowerShell.
+[wsl2]
+# Mirrored networking: 127.0.0.1 inside WSL reaches services on the Windows host,
+# so OpenClaw can use http://127.0.0.1:8000 while the orchestrator stays bound to localhost.
+networkingMode=mirrored
+# Cap WSL's RAM. By default it may take half of the 16 GB, which the Windows side needs.
+memory=5GB
+swap=4GB

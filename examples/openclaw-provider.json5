@@ -1,0 +1,27 @@
+// Merge into ~/.openclaw/openclaw.json inside the WSL distro, then: openclaw gateway restart
+// baseUrl points at the ORCHESTRATOR, not at Ollama. No /v1, no trailing slash.
+// api: "ollama" is required: memory is only injected on the native /api/chat route.
+{
+  models: {
+    providers: {
+      ollama: {
+        baseUrl: "http://127.0.0.1:8000",
+        api: "ollama",
+        apiKey: "ollama-local",          // any value; Ollama does not check it
+        timeoutSeconds: 600,
+        models: [
+          {
+            id: "qwen3:14b",
+            name: "qwen3:14b",
+            reasoning: true,
+            input: ["text"],
+            contextWindow: 16384,        // keep equal to ollama.primary.num_ctx in config.yaml
+            maxTokens: 4096,
+            params: { keep_alive: "30m" },
+          },
+        ],
+      },
+    },
+  },
+  agents: { defaults: { model: { primary: "ollama/qwen3:14b" } } },
+}
