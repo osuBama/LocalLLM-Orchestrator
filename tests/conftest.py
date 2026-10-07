@@ -90,6 +90,24 @@ class FakeOllama:
                 yield json.dumps(final) + "\n"
             return StreamingResponse(gen(), media_type="application/x-ndjson")
 
+        self.ps_models: dict[str, dict] = {}         # name -> /api/ps entry
+        self.vram_fits_at: dict[str, int] = {}       # model -> largest num_ctx that is 100% on GPU
+
+        @app.post("/api/generate")
+        async def generate(request: Request):
+            body = await request.json()
+            self.requests.append(body)
+            name = body["model"]
+            if body.get("keep_alive") == 0:
+                self.ps_models.pop(name, None)
+                return {"model": name, "done": True}
+            ctx = (body.get("options") or {}).get("num_ctx", 2048)
+            limit = self.vram_fits_at.get(name, 10**9)
+            size = 1000 + ctx // 10
+            vram = size if ctx <= limit else int(size * 0.8)
+            self.ps_models[name] = {"name": name, "size": size, "size_vram": vram, "context_length": ctx}
+            return {"model": name, "done": True, "response": ""}
+
         @app.get("/api/tags")
         async def tags():
             return {"models": [{"name": "qwen3:14b"}]}
@@ -100,6 +118,8 @@ class FakeOllama:
 
         @app.get("/api/ps")
         async def ps():
+            if self.ps_models:
+                return {"models": list(self.ps_models.values())}
             return {"models": [{"name": "qwen3:14b", "size": 100, "size_vram": 100, "context_length": 16384}]}
 
         @app.get("/")

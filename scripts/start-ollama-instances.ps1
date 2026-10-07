@@ -33,6 +33,7 @@ param(
     [string]$ModelsDir = $env:OLLAMA_MODELS,   # e.g. D:\AI\models - shared by both instances
     [string]$LogDir = (Join-Path (Split-Path -Parent $PSScriptRoot) "logs"),
     [string]$KvCacheType = "q8_0",             # halves KV-cache VRAM vs f16; needs flash attention
+    [switch]$SingleGpu,                        # one GPU: one instance holding both models
     [switch]$ListGpus,
     [switch]$Status,
     [switch]$Stop,
@@ -86,7 +87,8 @@ function Wait-Ollama([int]$port) {
 if ($ListGpus) { Get-Gpus | Format-Table -AutoSize; return }
 
 if ($Status) {
-    foreach ($port in @($PrimaryPort, $MemoryPort)) {
+    $statusPorts = if ($SingleGpu) { @($PrimaryPort) } else { @($PrimaryPort, $MemoryPort) }
+    foreach ($port in $statusPorts) {
         Write-Host "`n== 127.0.0.1:$port ==" -ForegroundColor Cyan
         try {
             $ps = Invoke-RestMethod "http://127.0.0.1:$port/api/ps" -TimeoutSec 3
@@ -120,11 +122,17 @@ if (-not $ollama) { throw "ollama.exe not on PATH." }
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
 $gpus = Get-Gpus
-$pGpu = Resolve-Gpu $PrimaryGpu $PrimaryMatch $gpus "Primary"
-$mGpu = Resolve-Gpu $MemoryGpu  $MemoryMatch  $gpus "Memory"
-if ($pGpu -eq $mGpu) { throw "Primary and memory resolved to the same GPU ($pGpu)." }
+if ($SingleGpu) {
+    $pGpu = if ($PrimaryGpu) { $PrimaryGpu } else { (@($gpus | Sort-Object MemoryMiB -Descending))[0].Uuid }
+    $mGpu = $pGpu
+} else {
+    $pGpu = Resolve-Gpu $PrimaryGpu $PrimaryMatch $gpus "Primary"
+    $mGpu = Resolve-Gpu $MemoryGpu  $MemoryMatch  $gpus "Memory"
+    if ($pGpu -eq $mGpu) { throw "Primary and memory resolved to the same GPU ($pGpu). Use -SingleGpu for one card." }
+}
+$ports = if ($SingleGpu) { @($PrimaryPort) } else { @($PrimaryPort, $MemoryPort) }
 
-foreach ($port in @($PrimaryPort, $MemoryPort)) {
+foreach ($port in $ports) {
     if (Test-Port $port) {
         if ($Force) {
             Write-Host "Port $port busy; stopping existing Ollama processes (-Force)..." -ForegroundColor Yellow
@@ -137,9 +145,11 @@ foreach ($port in @($PrimaryPort, $MemoryPort)) {
 }
 
 $instances = @(
-    @{ Role = "primary"; Port = $PrimaryPort; Gpu = $pGpu; Ctx = $PrimaryContext },
-    @{ Role = "memory";  Port = $MemoryPort;  Gpu = $mGpu; Ctx = $MemoryContext }
+    @{ Role = "primary"; Port = $PrimaryPort; Gpu = $pGpu; Ctx = $PrimaryContext; Max = $(if ($SingleGpu) { "2" } else { "1" }) }
 )
+if (-not $SingleGpu) {
+    $instances += @{ Role = "memory"; Port = $MemoryPort; Gpu = $mGpu; Ctx = $MemoryContext; Max = "1" }
+}
 $vars = "OLLAMA_HOST","CUDA_VISIBLE_DEVICES","OLLAMA_MODELS","OLLAMA_FLASH_ATTENTION",
         "OLLAMA_KV_CACHE_TYPE","OLLAMA_NUM_PARALLEL","OLLAMA_MAX_LOADED_MODELS",
         "OLLAMA_CONTEXT_LENGTH","OLLAMA_KEEP_ALIVE"
@@ -154,7 +164,7 @@ try {
         $env:OLLAMA_FLASH_ATTENTION   = "1"
         $env:OLLAMA_KV_CACHE_TYPE     = $KvCacheType
         $env:OLLAMA_NUM_PARALLEL      = "1"   # each parallel slot costs a full KV cache
-        $env:OLLAMA_MAX_LOADED_MODELS = "1"
+        $env:OLLAMA_MAX_LOADED_MODELS = $i.Max
         $env:OLLAMA_CONTEXT_LENGTH    = "$($i.Ctx)"
         $env:OLLAMA_KEEP_ALIVE        = "30m"
         if ($ModelsDir) { $env:OLLAMA_MODELS = $ModelsDir }

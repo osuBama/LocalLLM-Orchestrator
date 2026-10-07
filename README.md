@@ -75,6 +75,45 @@ changes; you can see that in `ai memory changes` (§11).
 
 ## 3. Install
 
+### 3.0 Quick setup (Windows + NVIDIA)
+
+`setup.ps1` does everything in sections 3–7 for you, and is safe to re-run:
+
+```powershell
+cd D:\AI
+powershell -ExecutionPolicy Bypass -File .\setup.ps1          # interactive (recommended)
+powershell -ExecutionPolicy Bypass -File .\setup.ps1 -Yes     # accept every default
+```
+
+What it does, in order:
+
+| Step | What happens | Touches outside this folder? |
+|---|---|---|
+| Preflight | Checks Python 3.11+, creates `.venv`, installs dependencies | no |
+| GPUs | Detects cards with `nvidia-smi`; larger VRAM = primary (`-PrimaryGpu/-MemoryGpu <UUID>` to override; one card = single-GPU mode) | no |
+| Ollama | Checks the install; offers to disable the tray app's autostart (shortcut and registry value are backed up) and to stop running Ollama | yes, asks first |
+| Models | Suggests models and context from VRAM (subtracting what your desktop already uses); you can override | no |
+| Instances | Starts the two pinned instances and pulls the models into one shared folder | no |
+| Context fit | Loads each model and steps `num_ctx` down until it is **100% on its GPU**, measured, not guessed | no |
+| config.yaml | Writes models, ports, fitted contexts and memory budgets; keeps comments; validates; backs up; rolls back if invalid | no |
+| Orchestrator | Starts it (restarting an old one) and checks `/health` | no |
+| WSL | Adds `networkingMode=mirrored` (and a RAM cap if none) to `.wslconfig`, keeping your other settings; offers `wsl --shutdown` | yes, asks first |
+| OpenClaw | Finds the distro with OpenClaw, backs up its config, points the Ollama provider at the orchestrator (`openclaw config patch`, falling back to `config set`, or leaves a file for a manual merge), sets the default model, restarts the gateway, and tests the connection from inside WSL | yes, asks first |
+| Autostart | Optionally registers two logon tasks (instances, then the orchestrator 45 s later) | yes, asks first (default no) |
+
+Useful options: `-PrimaryModel/-MemoryModel` and `-PrimaryContext/-MemoryContext` (starting points for the
+fit), `-ModelsDir`, `-WslDistro`, `-SingleGpu`, `-SkipPull`, `-SkipFit`, `-SkipWsl`, `-SkipOpenClaw`,
+`-NoStart`, `-Autostart`/`-NoAutostart`, and the ports. A full transcript goes to `logs\setup-<time>.log`.
+Backups go to `backups\setup-<time>\`, next to `config.yaml` (`config.yaml.bak-*`) and next to the
+OpenClaw config (`openclaw.json.bak-*`). To undo autostart, delete the two "AI Orchestrator" tasks in
+Task Scheduler.
+
+The rest of this section and sections 4–7 describe the same steps by hand, for Linux, AMD, or anyone
+who prefers to see each piece. `python -m app.setup_tools` (GPU detection, model plan, config editing,
+context fitting, OpenClaw patch) works on Linux too.
+
+### 3.1 Manual install
+
 Pick an install folder (examples use `D:\AI`; any path works). Copy this project so the folder
 contains `app\`, `config\`, `prompts\`, `scripts\`, `memory\`.
 
@@ -515,6 +554,6 @@ traffic. `ai memory changes` (rejection rate), `ai memory sessions` (summary qua
   `project_id`).
 - A large second GPU could take on more: embeddings, a bigger memory model, or splitting one large
   primary model across both cards instead. That trades the memory system for raw model size.
-- Tested with fake Ollama instances (126 tests: validator, atomic writes, streaming, flag stripping,
-  trimming, compression and memory-base cache stability, consolidation guards, evaluation harness, retries…). Real-GPU behaviour (pinning, VRAM fit, a given
+- Tested with fake Ollama instances (142 tests: validator, atomic writes, streaming, flag stripping,
+  trimming, compression and memory-base cache stability, consolidation guards, evaluation harness, setup helpers, retries…). Real-GPU behaviour (pinning, VRAM fit, a given
   model's JSON quality) can only be verified on your machine (§4.5); the evaluation harness (§11) is how you do that.
