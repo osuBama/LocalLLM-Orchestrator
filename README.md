@@ -40,8 +40,7 @@ client ──► orchestrator :8000 ──► Ollama A (GPU 1)  primary model
 **Windows (recommended):**
 
 ```powershell
-git clone <this repo> D:\AI
-cd D:\AI
+git clone <this repo>
 powershell -ExecutionPolicy Bypass -File .\setup.ps1
 ```
 
