@@ -98,6 +98,19 @@ CREATE TABLE IF NOT EXISTS kv (
     value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS golden_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    turn INTEGER NOT NULL,
+    question TEXT NOT NULL,
+    wrong_answer TEXT NOT NULL,
+    correction TEXT NOT NULL,
+    suggested_expect TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','accepted','dismissed')),
+    case_name TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON memory_tasks(status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_changes_conv ON memory_changes(conversation_id);
 """
@@ -312,6 +325,37 @@ class Database:
         with self.connect() as c:
             return int(c.execute("SELECT COUNT(*) n FROM memory_tasks WHERE status IN ('pending','processing')")
                        .fetchone()["n"])
+
+    # ------------------------------------------------------ golden candidates
+    def add_candidate(self, conversation_id: str, turn: int, question: str, wrong_answer: str,
+                      correction: str, suggested: list[str]) -> int:
+        with self.connect() as c:
+            dup = c.execute("SELECT id FROM golden_candidates WHERE conversation_id=? AND turn=?",
+                            (conversation_id, turn)).fetchone()
+            if dup:
+                return int(dup["id"])
+            cur = c.execute(
+                """INSERT INTO golden_candidates (created_at, conversation_id, turn, question, wrong_answer,
+                       correction, suggested_expect) VALUES (?,?,?,?,?,?,?)""",
+                (now_iso(), conversation_id, turn, question, wrong_answer, correction,
+                 json.dumps(suggested, ensure_ascii=False)))
+            return int(cur.lastrowid)
+
+    def candidates(self, status: str | None = "pending", limit: int = 100) -> list[dict]:
+        q, args = "SELECT * FROM golden_candidates", []
+        if status:
+            q += " WHERE status=?"
+            args.append(status)
+        with self.connect() as c:
+            rows = [dict(r) for r in c.execute(q + " ORDER BY id DESC LIMIT ?", (*args, limit))]
+        for r in rows:
+            r["suggested_expect"] = json.loads(r["suggested_expect"] or "[]")
+        return rows
+
+    def set_candidate_status(self, cid: int, status: str, case_name: str | None = None) -> bool:
+        with self.connect() as c:
+            return c.execute("UPDATE golden_candidates SET status=?, case_name=COALESCE(?, case_name) WHERE id=?",
+                             (status, case_name, cid)).rowcount > 0
 
     # ------------------------------------------------------------ tool digests
     def get_digests(self, hashes: list[str]) -> dict[str, dict]:

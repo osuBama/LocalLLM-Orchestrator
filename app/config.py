@@ -62,12 +62,17 @@ class MemoryConfig(_Strict):
     worker_poll_seconds: float = 2.0
     max_attempts: int = 5
     retry_base_seconds: float = 30.0
+    # Background jobs nobody waits on may let the memory model think (better judgement).
+    # Summaries and digests stay fast: the next prompt may need them.
+    think_extraction: bool = True
+    think_consolidation: bool = True
 
 
 class ConversationConfig(_Strict):
     retain_raw_history: bool = True
     format: Literal["jsonl"] = "jsonl"
     recent_turns: int = Field(2, ge=0)   # short-term window for POST /chat (memory covers the rest)
+    capture_corrections: bool = True     # your corrections become golden-question candidates
 
 
 class ProxyConfig(_Strict):
@@ -82,6 +87,7 @@ class ProxyConfig(_Strict):
     trim_mode: Literal["size", "turns"] = "size"
     trim_target_ratio: float = Field(0.5, gt=0.1, lt=1.0)
     reply_reserve_tokens: int = Field(1024, ge=0)
+    calibrate_tokens: bool = True     # learn chars/token per model from Ollama's own counts
     # Stepped trimming: once history exceeds trim_trigger_user_turns, cut it back to
     # about trim_keep_user_turns. The cut point then stays fixed for several turns,
     # so Ollama's prompt cache keeps hitting. 0 disables trimming.
@@ -140,6 +146,12 @@ class ConsolidationConfig(_Strict):
     stale_after_days: int = Field(30, ge=1)         # review list: active but never injected
 
 
+class ThinkingConfig(_Strict):
+    """Per-turn thinking for the primary. auto = turn it off only for clearly simple turns."""
+    mode: Literal["auto", "client", "on", "off"] = "auto"
+    simple_max_words: int = Field(25, ge=1)
+
+
 class SessionConfig(_Strict):
     summaries_enabled: bool = True
     summary_max_tokens: int = Field(400, ge=50, le=2000)
@@ -162,6 +174,7 @@ class Config(_Strict):
     compression: CompressionConfig = CompressionConfig()
     stable_memory: StableMemoryConfig = StableMemoryConfig()
     consolidation: ConsolidationConfig = ConsolidationConfig()
+    thinking: ThinkingConfig = ThinkingConfig()
 
     @model_validator(mode="after")
     def _check_compression(self):

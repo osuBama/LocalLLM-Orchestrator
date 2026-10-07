@@ -32,7 +32,7 @@ def test_successful_update(orch):
     assert o.db.list_changes()[0]["status"] == "approved"
     assert o.db.list_memories()[0]["entry_key"] == "S-001"
     sent = memory.requests[0]
-    assert sent["format"]["required"] == ["changes"] and sent["think"] is False
+    assert sent["format"]["required"] == ["changes"] and sent["think"] is True   # background: may think
 
 
 def test_failed_update_retries_then_fails(orch):
@@ -81,3 +81,32 @@ def test_memory_failure_does_not_affect_primary(orch):
     assert out["response"] == "fake answer" and out["memory_update_queued"]
     asyncio.run(o.worker.process_next())
     assert o.db.list_tasks()[0]["status"] == "pending"
+
+
+def test_extraction_retries_without_thinking_when_json_breaks(orch):
+    o, _, memory = orch
+    calls = []
+    good = {"changes": [{"category": "lesson", "operation": "add", "title": "Route",
+                         "content": "The MCP route is /mcp.", "confidence": 0.9, "reason": "r"}]}
+    orig = memory.app.router.routes
+
+    @memory.app.middleware("http")
+    async def think_breaks_json(request, call_next):
+        body = await request.json() if request.url.path == "/api/chat" else None
+        if body is not None:
+            calls.append(body.get("think"))
+            memory.memory_json = "<think>hmm</think> not json" if body.get("think") else good
+        return await call_next(request)
+    o.worker.enqueue(task())
+    asyncio.run(o.worker.process_next())
+    assert calls == [True, False]
+    assert o.manager.stores[Category.lesson].entries()[0].content == "The MCP route is /mcp."
+
+
+def test_summaries_and_digests_never_think(orch):
+    o, _, memory = orch
+    memory.reply = "summary"
+    t = InteractionTask("c1", "t", "u", "a", turn_number=1)
+    o.worker.enqueue_summary(t)
+    asyncio.run(o.worker.process_next())
+    assert memory.requests[-1]["think"] is False

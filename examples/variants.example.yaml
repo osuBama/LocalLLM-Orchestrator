@@ -16,3 +16,11 @@ variants:
     proxy.trim_mode: turns
   bigger-summary:
     session.summary_max_tokens: 800
+  # Thinking: run with `--think default` so the orchestrator decides, then compare
+  # accuracy and request time between these.
+  thinking-always:
+    thinking.mode: client
+  thinking-auto:
+    thinking.mode: auto
+  no-calibration:
+    proxy.calibrate_tokens: false

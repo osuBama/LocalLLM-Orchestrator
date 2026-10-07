@@ -147,12 +147,17 @@ def create_app(config: Config | None = None, *,
         return {"stale_after_days": config.consolidation.stale_after_days,
                 "entries": orch.consolidator.review()}
 
+    @app.get("/eval/candidates")
+    async def eval_candidates(all: bool = False):
+        return {"candidates": orch.db.candidates(status=None if all else "pending")}
+
     @app.get("/metrics")
     async def metrics():
         snap = orch.metrics.snapshot()
         snap["memory_tasks"] = orch.db.task_counts()
         snap["memory_store_tokens"] = orch.manager.memory_tokens()
         snap["tool_digests"] = orch.db.digest_stats()
+        snap["token_calibration"] = orch.calibrator.snapshot()
         return snap
 
     # ---------------------------------------------- OpenClaw / Ollama proxy

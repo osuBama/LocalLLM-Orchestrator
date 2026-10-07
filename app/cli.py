@@ -160,6 +160,33 @@ def cmd_eval(cfg, args) -> int:
     from pathlib import Path
 
     from . import evaluation as ev
+    if args.eval_cmd in ("candidates", "accept", "dismiss"):
+        from .database import Database
+        db = Database(cfg.database_path)
+        if args.eval_cmd == "candidates":
+            rows = db.candidates(status=None if args.all else "pending")
+            if not rows:
+                print("No pending candidates. They appear when you correct the model (e.g. 'no, it's X').")
+            for r in rows:
+                print(f"#{r['id']} [{r['status']}] {r['conversation_id']} turn {r['turn']}")
+                print(f"   asked:      {r['question'][:100]!r}")
+                print(f"   answered:   {r['wrong_answer'][:100]!r}")
+                print(f"   correction: {r['correction'][:100]!r}")
+                print(f"   suggested expect_all: {r['suggested_expect'] or '(none: pass --expect)'}")
+            return 0
+        if args.eval_cmd == "dismiss":
+            ok = db.set_candidate_status(args.id, "dismissed")
+            print("dismissed" if ok else f"no candidate #{args.id}")
+            return 0 if ok else 2
+        golden = Path(args.golden) if args.golden else cfg.root_dir / "evals" / "golden.yaml"
+        try:
+            out = ev.accept_candidate(db, args.id, golden, expect=args.expect, forbid=args.forbid, name=args.name)
+        except ValueError as e:
+            print(f"Not accepted: {e}")
+            return 2
+        print(f"Added case {out['case']['name']!r} to {out['file']}")
+        return 0
+
     recorded = ev.load_recorded_sessions(cfg.conversations_dir)
     if args.eval_cmd == "sessions":
         if not recorded:
@@ -205,7 +232,7 @@ def cmd_eval(cfg, args) -> int:
         cfg, variants=variants, variant_names=names, sessions=sessions, golden=golden,
         max_turns=args.max_turns, memory=args.memory, extract=args.extract,
         think=None if args.think == "default" else args.think == "on", client_system=client_system,
-        max_answer_tokens=args.max_answer_tokens, seed=args.seed))
+        max_answer_tokens=args.max_answer_tokens or (512 if args.think == "off" else 4096), seed=args.seed))
     print()
     print(Path(report["files"]["markdown"]).read_text(encoding="utf-8"))
     print(f"Report: {report['files']['markdown']}\nJSON:   {report['files']['json']}")
@@ -254,6 +281,16 @@ def main(argv: list[str] | None = None) -> int:
     e = sp.add_parser("eval", help="evaluation harness (README §11)")
     esp = e.add_subparsers(dest="eval_cmd", required=True)
     esp.add_parser("sessions", help="list recorded sessions available for replay")
+    s = esp.add_parser("candidates", help="corrections captured as golden-question candidates")
+    s.add_argument("--all", action="store_true", help="include accepted/dismissed")
+    s = esp.add_parser("accept", help="add a candidate to evals/golden.yaml")
+    s.add_argument("id", type=int)
+    s.add_argument("--expect", action="append", help="must appear in the answer (repeatable; /regex/ ok)")
+    s.add_argument("--forbid", action="append", help="must NOT appear (repeatable)")
+    s.add_argument("--name")
+    s.add_argument("--golden", help="golden file (default: evals/golden.yaml)")
+    s = esp.add_parser("dismiss", help="discard a candidate")
+    s.add_argument("id", type=int)
     s = esp.add_parser("run", help="replay sessions / golden questions under config variants")
     s.add_argument("--variant", default="baseline,full",
                    help="comma-separated; first is the comparison baseline (default: baseline,full)")
@@ -269,7 +306,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--extract", action="store_true", help="also run memory extraction during replay")
     s.add_argument("--think", choices=["off", "on", "default"], default="off")
     s.add_argument("--client-system", help="file with your client's real system prompt (e.g. OpenClaw's)")
-    s.add_argument("--max-answer-tokens", type=int, default=512)
+    s.add_argument("--max-answer-tokens", type=int,
+                   help="default 512 with --think off, 4096 otherwise (thinking counts toward the limit)")
     s.add_argument("--seed", type=int, default=42)
 
     args = p.parse_args(argv)

@@ -297,11 +297,18 @@ class Consolidator:
                 group = [current[e.entry_id] for e in group if e.entry_id in current]
                 if (kind == "merge" and len(group) < 2) or not group:
                     continue
-                resp = await orch.memory_client.chat(self._messages(kind, cat, group), format=SCHEMA,
-                                                     options={"temperature": 0.1})
-                try:
-                    data = json.loads(resp["message"]["content"])
-                except (json.JSONDecodeError, TypeError):
+                think = orch.config.memory.think_consolidation
+                msgs = self._messages(kind, cat, group)
+                data = None
+                for attempt_think in ([True, False] if think else [False]):
+                    resp = await orch.memory_client.chat(msgs, format=SCHEMA, options={"temperature": 0.1},
+                                                         think=attempt_think)
+                    try:
+                        data = json.loads(resp["message"]["content"])
+                        break
+                    except (json.JSONDecodeError, TypeError):
+                        data = None
+                if data is None:
                     report.rejected.append({"category": cat.value, "reason": "invalid JSON"})
                     continue
                 accepted, rejected = self._validate(data, cat, group, kind, used)

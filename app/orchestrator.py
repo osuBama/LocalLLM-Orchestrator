@@ -47,6 +47,8 @@ class Orchestrator:
         self.primary = OllamaClient(config.ollama.primary, transport=primary_transport)
         self.memory_client = OllamaClient(config.ollama.memory, transport=memory_transport)
         self.metrics = Metrics()
+        from .calibration import TokenCalibrator
+        self.calibrator = TokenCalibrator(self.db)
         self.worker = MemoryWorker(config, self.db, self.manager, self.memory_client,
                                    self.context_builder, self.metrics)
         self.primary_system = config.prompt("primary_system.txt")
@@ -118,6 +120,26 @@ class Orchestrator:
         await self.consolidator.run(trigger="idle")
         return True
 
+    def capture_correction(self, conversation_id: str, turn: int, user_message: str,
+                           prev_question: str | None, prev_answer: str | None) -> int | None:
+        """If this turn corrects the previous answer, save a golden-question candidate."""
+        if not (self.config.conversation.capture_corrections and prev_question and prev_answer and turn >= 2):
+            return None
+        from .consolidation import identifiers
+        from .triggers import _RULES
+        if not _RULES["correction"].search(user_message or ""):
+            return None
+        suggested = sorted(identifiers(user_message) - identifiers(prev_answer) - identifiers(prev_question))
+        try:
+            cid = self.db.add_candidate(conversation_id, turn, prev_question[:4000], prev_answer[:4000],
+                                        user_message[:2000], suggested[:5])
+            log.info("golden candidate captured", extra={"conversation_id": conversation_id,
+                                                         "detail": f"#{cid} turn {turn}"})
+            return cid
+        except Exception:
+            log.exception("could not store golden candidate")
+            return None
+
     def system_prompt(self, base: StableSnapshot | None) -> str:
         return self.primary_system + (f"\n\n{base.text}" if base and base.text else "")
 
@@ -182,8 +204,13 @@ class Orchestrator:
                "memory_retrieval_count": len(ctx.included), "memory_tokens": ctx.token_estimate,
                "memory_base_tokens": base.tokens if base else 0,
                "total_context_tokens": sum(estimate_tokens(m["content"]) for m in messages)}
+        from . import thinking
+        think, think_reason = thinking.decide(self.config.thinking.mode, None, message,
+                                              self.config.thinking.simple_max_words)
+        rec["thinking"] = "default" if think is thinking.KEEP else ("on" if think else "off")
+        rec["thinking_reason"] = think_reason
         try:
-            resp = await self.primary.chat(messages)
+            resp = await self.primary.chat(messages, think=None if think is thinking.KEEP else think)
         except OllamaError as e:
             rec.update(error=str(e), total_request_time=round(time.perf_counter() - t0, 3))
             self.metrics.record_request(rec)
@@ -202,6 +229,9 @@ class Orchestrator:
         self.metrics.record_request(rec)
         plog.info("primary request", extra=rec)
 
+        prev = list(recent)
+        if len(prev) >= 2 and prev[-2]["role"] == "user" and prev[-1]["role"] == "assistant":
+            self.capture_correction(conversation_id, turn_number, message, prev[-2]["content"], prev[-1]["content"])
         recent.append({"role": "user", "content": message})
         recent.append({"role": "assistant", "content": answer})
         task = self.record_turn(conversation_id=conversation_id, user_message=message,

@@ -47,11 +47,14 @@ memory:
   worker_poll_seconds: 2
   max_attempts: 5
   retry_base_seconds: 30
+  think_extraction: true        # memory model may think on extraction (background, nobody waits)
+  think_consolidation: true     # ...and on idle-time consolidation
 
 conversation:
   retain_raw_history: true
   format: "jsonl"
   recent_turns: 2               # POST /chat only: last N exchanges sent verbatim alongside memory
+  capture_corrections: true     # "no, it's X" turns become golden-question candidates (ai eval candidates)
 
 proxy:
   # Ollama-compatible endpoint for OpenClaw (native API, /api/chat).
@@ -67,6 +70,7 @@ proxy:
   trim_mode: size
   trim_target_ratio: 0.5       # lower = deeper, rarer cuts (cheaper, leans more on summaries)
   reply_reserve_tokens: 1024
+  calibrate_tokens: true        # size estimates learn chars/token from Ollama's real counts
   # Turn-count trimming (trim_mode: turns). In size mode trim_keep_user_turns is the minimum
   # number of recent turns always kept verbatim. When it grows past 10 user turns it is cut
   # back to ~4; the cut point then stays put for 5-6 turns so the prompt cache keeps hitting.
@@ -117,6 +121,14 @@ consolidation:
   max_changes_per_run: 10
   max_cluster_size: 6
   stale_after_days: 30          # `ai memory review` lists active entries never used for this long
+
+thinking:
+  # Primary-model thinking per turn. auto: thinking is switched OFF only for clearly simple
+  # turns (short, no code/errors, no why/debug/design/implement-type words, EN+PT); otherwise
+  # the client's choice stands. Saying "think" or "step by step" always keeps it on.
+  # client: never touch it. on/off: force it.
+  mode: auto
+  simple_max_words: 25
 
 session:
   # Rolling per-conversation summary kept by the memory model, injected once history is trimmed.

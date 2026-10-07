@@ -245,10 +245,19 @@ class MemoryWorker:
 
     async def process(self, task: InteractionTask, task_id: int | None = None) -> list[AppliedChange]:
         messages = self.build_messages(task)
+        think = self.config.memory.think_extraction
         resp = await self.client.chat(messages, format=MEMORY_CHANGE_JSON_SCHEMA,
-                                      options={"temperature": 0.1})
+                                      options={"temperature": 0.1}, think=think)
         raw = resp["message"]["content"]
         result = self.validator.validate_text(raw, self.manager.existing())
+        if not result.parsed and think:
+            # Some model/Ollama combinations don't mix thinking with structured output
+            # cleanly: retry once without thinking before counting it as a failure.
+            log.info("extraction retry without thinking", extra={"task_id": task_id})
+            resp = await self.client.chat(messages, format=MEMORY_CHANGE_JSON_SCHEMA,
+                                          options={"temperature": 0.1}, think=False)
+            raw = resp["message"]["content"]
+            result = self.validator.validate_text(raw, self.manager.existing())
         if not result.parsed:
             # Spec §22: log, do not modify memory, keep the raw interaction (it is in JSONL).
             log.warning("memory model output rejected", extra={
@@ -283,7 +292,7 @@ class MemoryWorker:
         max_tokens = self.config.session.summary_max_tokens
         messages = self.build_summary_messages(task, prev["summary"] if prev else "")
         resp = await self.client.chat(messages, options={"temperature": 0.2,
-                                                         "num_predict": int(max_tokens * 1.6)})
+                                                         "num_predict": int(max_tokens * 1.6)}, think=False)
         text = remove_flag_tags(resp["message"]["content"]).strip()
         if not text:
             raise MemoryParseError("empty session summary")
@@ -310,7 +319,8 @@ class MemoryWorker:
         system = self.digest_prompt.replace("{max_words}", str(int(max_tokens * 0.7)))
         resp = await self.client.chat([{"role": "system", "content": system},
                                        {"role": "user", "content": body}],
-                                      options={"temperature": 0.1, "num_predict": int(max_tokens * 1.6)})
+                                      options={"temperature": 0.1, "num_predict": int(max_tokens * 1.6)},
+                                      think=False)
         text = remove_flag_tags(resp["message"]["content"]).strip()
         if not text:
             raise MemoryParseError("empty tool digest")

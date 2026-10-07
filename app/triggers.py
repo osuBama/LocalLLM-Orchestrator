@@ -12,7 +12,8 @@ from .schemas import InteractionTask
 _RULES: dict[str, re.Pattern] = {
     "correction": re.compile(
         r"\b(that'?s (wrong|incorrect|not right)|you'?re wrong|not what i (asked|meant)|"
-        r"actually,|no,? (it|that|this) (is|was|isn'?t)|i said|está errado|não é isso|"
+        r"actually,|no,? (it|that|this)(['’]s| is| was| isn['’]?t| wasn['’]?t)|"
+        r"i said|i meant|not \d+|it should be|está errado|não é isso|não,? (é|era)|"
         r"estás errado|corrig)", re.I),
     "success": re.compile(
         r"\b(works now|it works|working now|fixed|solved|resolved|success(ful(ly)?)?|"

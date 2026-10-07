@@ -284,6 +284,9 @@ All context-saving features are on by default and scale with your settings.
 | Tool-output compression | `compression.min_result_tokens`, `keep_recent_user_turns`, `digest_max_tokens` | Defaults suit most setups. `keep_recent` must be smaller than `trim_keep`. |
 | Session summaries | `session.summary_max_tokens` | 400; raise it if long sessions lose details. |
 | Memory flags | `flags.enabled` | On; costs the primary ~20–50 tokens only on turns that flag something. |
+| Primary thinking | `thinking.mode` (`auto`), `thinking.simple_max_words` | `auto` turns thinking off only for clearly simple turns (§9.7). Use `client` to never touch it. |
+| Memory-model thinking | `memory.think_extraction`, `memory.think_consolidation` | On: background jobs nobody waits on get better judgement. Summaries and digests never think. |
+| Token calibration | `proxy.calibrate_tokens` | On: size-based trimming learns your model's real chars/token (§9.8). |
 | Memory base (cached) | `stable_memory.max_tokens`, `categories` | ~40% of `memory.max_context_tokens`. It's part of that budget, not extra. |
 
 If `ai status` ever shows less than 100% GPU, **lower `num_ctx` first**. Keep the client's own
@@ -424,6 +427,41 @@ injected context and weaken retrieval. When the system is idle, the memory GPU t
 
 `GET /memory/consolidation` shows whether a run is due, why or why not, and the last run's report.
 
+### 9.7 Thinking per turn
+
+Models with a thinking mode (Qwen3 and others) can spend hundreds to thousands of tokens reasoning
+before they answer. That's worth it for debugging and design, and pure latency for "run the tests". With
+`thinking.mode: auto` the orchestrator decides once per user turn, and keeps that decision for every
+tool-call step of the turn:
+
+- Thinking is turned **off** only when the turn is short (`simple_max_words`, 25) and shows none of: code,
+  error or diagnostic output, or words like why / how does / debug / design / implement / fix / explain /
+  compare (English and Portuguese).
+- It is **never turned on** if the client didn't ask, and a client that disabled it stays disabled.
+- Saying "think", "step by step" or "carefully" keeps thinking on regardless.
+- `/metrics` shows `thinking` (on / off / client) and the reason per request.
+
+Check the trade-off on your work with `ai eval run --think default --variant thinking-always,thinking-auto`
+(definitions in `examples\variants.example.yaml`): compare golden pass rates and request times.
+
+The memory model thinks on **extraction and consolidation**, which run in the background. If a thinking
+run doesn't produce valid JSON (some model and Ollama combinations don't mix thinking with structured
+output well), it is retried once without thinking before counting as a failure. Session summaries and tool
+digests never think, because the next prompt may be waiting for them.
+
+### 9.8 Token calibration
+
+Size-based trimming (§9.4) has to estimate tokens before Ollama sees the prompt. The safe default
+(~3.5 characters per token) overestimates for most models and so trims earlier than needed. With
+`proxy.calibrate_tokens`, the orchestrator learns each model's ratio from Ollama's own counts:
+
+- Ollama reports the tokens it processed, and cache hits only lower that number, so only requests that
+  processed close to the whole prompt are recorded.
+- The **lowest** recorded ratio is used, plus a 5% margin. Template tokens and tool schemas only push it
+  down, which is the safe direction: an overestimated ratio would mean silent context overflow.
+- It needs 5 observations; until then the default applies. Values persist across restarts. Current values
+  are in `/metrics` under `token_calibration`.
+
 ## 10. CLI and API
 
 `ai` is `ai.cmd` on Windows and `python -m app.cli` on Linux.
@@ -434,6 +472,7 @@ ai memory show [category] | search "text" | context "prompt" | changes | tasks |
 ai memory validate | backup | rebuild [--replay [--reset]] | restore <backup-dir>
 ai memory consolidate [--dry-run] | review
 ai eval sessions | ai eval run [--variant a,b,…] [--sessions …] [--golden …] [--max-turns N]
+ai eval candidates [--all] | ai eval accept <id> [--expect X] [--forbid Y] | ai eval dismiss <id>
 ```
 
 `ai memory context "prompt"` shows exactly what would be injected for a prompt. `rebuild` alone
@@ -485,6 +524,25 @@ ai eval run --variant baseline,full,no-compression --sessions oc-1234,oc-5678 --
   Copy `examples\golden.example.yaml` to `evals\golden.yaml` and write cases about your own work. The
   most informative ones ask about details from **early** in a long session (tests trimming and
   summaries), from **old tool output** (tests compression), or facts that only live in long-term memory.
+
+### 11.1b Golden questions from your own corrections
+
+When you correct the model, e.g. "no, it's 11435" or "that's wrong, it should be qwen3:14b", the
+orchestrator records a **candidate**: the question that got the wrong answer, the wrong answer, your
+correction, and a suggested check (identifiers in your correction that weren't in the wrong answer).
+Nothing changes until you decide:
+
+```
+ai eval candidates                         # review what was captured
+ai eval accept 7                           # use the suggested check
+ai eval accept 8 --expect dogs --forbid cats --name pet-topic
+ai eval dismiss 9
+```
+
+Accepting appends a case to `evals\golden.yaml` (your comments are kept; the file is validated and left
+unchanged if the result wouldn't load). The case replays that recorded session up to just before the
+question and asks it again. Over time your golden set becomes a record of what actually went wrong,
+which is the most useful thing it can test. Turn it off with `conversation.capture_corrections: false`.
 
 ### 11.2 Variants
 
@@ -554,6 +612,6 @@ traffic. `ai memory changes` (rejection rate), `ai memory sessions` (summary qua
   `project_id`).
 - A large second GPU could take on more: embeddings, a bigger memory model, or splitting one large
   primary model across both cards instead. That trades the memory system for raw model size.
-- Tested with fake Ollama instances (142 tests: validator, atomic writes, streaming, flag stripping,
-  trimming, compression and memory-base cache stability, consolidation guards, evaluation harness, setup helpers, retries…). Real-GPU behaviour (pinning, VRAM fit, a given
+- Tested with fake Ollama instances (173 tests: validator, atomic writes, streaming, flag stripping,
+  trimming, compression and memory-base cache stability, consolidation guards, evaluation harness, setup helpers, thinking decisions, token calibration, correction capture, retries…). Real-GPU behaviour (pinning, VRAM fit, a given
   model's JSON quality) can only be verified on your machine (§4.5); the evaluation harness (§11) is how you do that.

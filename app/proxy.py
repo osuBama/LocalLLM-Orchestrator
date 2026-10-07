@@ -26,6 +26,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 import hashlib
 import json
+import math
 import logging
 import time
 import uuid
@@ -37,6 +38,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from . import compression
 from .context_builder import BuiltContext, StableSnapshot, wrap_user_request
 from .flags import FlagStripper
+from . import thinking
 from .metrics import Metrics
 from .ollama_client import OllamaError
 from .orchestrator import Orchestrator
@@ -208,6 +210,8 @@ class TurnPlan:
     frozen: dict[str, str] = field(default_factory=dict)  # result hash -> digest
     base: StableSnapshot | None = None                  # frozen memory base for the system prompt
     est_size: int | None = None                         # size mode: estimated prompt tokens
+    think: object = None                                # thinking.KEEP or a bool to send
+    think_reason: str = ""
 
 
 # ---------------------------------------------------------------- router
@@ -245,25 +249,30 @@ def build_router(orch: Orchestrator) -> APIRouter:
     def size_mode() -> bool:
         return cfg.proxy.trim_mode == "size" and bool(cfg.ollama.primary.num_ctx)
 
-    def estimate_prompt(conversation_id: str, original: list[dict], tools_tokens: int,
-                        cut: int, boundary: int) -> int:
+    def estimate_prompt(conversation_id: str, original: list[dict], tools_chars: int,
+                        cut: int, boundary: int, model: str = "") -> int:
         """Rough prompt size if history were cut at `cut` and compressed up to `boundary`.
 
         Includes the system prompt we add, the client's tool schemas, a per-message
-        template allowance, and reserves for the memory block and the reply. Errs large:
-        an overflow is silent truncation, an underestimate of free room just costs a cut.
+        template allowance, and reserves for the memory block and the reply. Characters
+        are converted with the per-model calibrated ratio (proxy.calibrate_tokens) or the
+        conservative default.
         """
         kept = drop_user_turns(original, cut)
         if boundary and cfg.compression.enabled:
             frozen = frozen_digests(conversation_id, cut, boundary, kept)
             kept, _, _ = compression.apply(kept, cut + 1, boundary, frozen,
                                            cfg.compression.min_result_tokens, never_tools)
-        body = sum(estimate_tokens(m["content"]) for m in kept if isinstance(m.get("content"), str))
-        return (body + 4 * len(kept) + tools_tokens + estimate_tokens(orch.primary_system)
-                + cfg.memory.max_context_tokens + cfg.proxy.reply_reserve_tokens)
+        chars = sum(len(m["content"]) for m in kept if isinstance(m.get("content"), str))
+        chars += tools_chars + len(orch.primary_system)
+        if cfg.proxy.calibrate_tokens:
+            body = orch.calibrator.tokens(model, chars)
+        else:
+            body = math.ceil(chars / 3.5)
+        return (body + 4 * len(kept) + cfg.memory.max_context_tokens + cfg.proxy.reply_reserve_tokens)
 
-    def size_layout(conversation_id: str, turn: int, original: list[dict], tools_tokens: int,
-                    covered: int) -> tuple[int, int, int]:
+    def size_layout(conversation_id: str, turn: int, original: list[dict], tools_chars: int,
+                    covered: int, model: str = "") -> tuple[int, int, int]:
         """(cut, boundary, estimated tokens) for size-triggered trimming.
 
         Nothing changes while the prompt fits num_ctx. When it would not fit:
@@ -276,18 +285,18 @@ def build_router(orch: Orchestrator) -> APIRouter:
         target = int(limit * cfg.proxy.trim_target_ratio)
         cut, boundary = size_state.get(conversation_id, (0, 0))
         cut = min(cut, max(0, turn - 1))
-        size = estimate_prompt(conversation_id, original, tools_tokens, cut, boundary)
+        size = estimate_prompt(conversation_id, original, tools_chars, cut, boundary, model)
         if size > limit:
             if cfg.compression.enabled:
                 boundary = max(boundary, turn - cfg.compression.keep_recent_user_turns)
-                size = estimate_prompt(conversation_id, original, tools_tokens, cut, boundary)
+                size = estimate_prompt(conversation_id, original, tools_chars, cut, boundary, model)
             if size > target:
                 max_cut = max(cut, turn - cfg.proxy.trim_keep_user_turns)
                 if cfg.proxy.trim_requires_summary and cfg.session.summaries_enabled:
                     max_cut = max(cut, min(max_cut, covered))
                 for d in range(cut + 1, max_cut + 1):
                     cut = d
-                    size = estimate_prompt(conversation_id, original, tools_tokens, cut, boundary)
+                    size = estimate_prompt(conversation_id, original, tools_chars, cut, boundary, model)
                     if size <= target:
                         break
         size_state[conversation_id] = (cut, boundary)
@@ -297,7 +306,7 @@ def build_router(orch: Orchestrator) -> APIRouter:
         return cut, boundary, size
 
     def plan_for(conversation_id: str, turn: int, user_text: str, original: list[dict],
-                 tools_tokens: int = 0) -> TurnPlan:
+                 tools_chars: int = 0, client_think=None, model: str = "") -> TurnPlan:
         key = (conversation_id, turn, hash(user_text))
         if key in plans:
             plans.move_to_end(key)
@@ -306,7 +315,7 @@ def build_router(orch: Orchestrator) -> APIRouter:
         if size_mode():
             summary = orch.session_summary(conversation_id)
             covered = summary["covered_turns"] if summary else 0
-            drop, boundary, est_size = size_layout(conversation_id, turn, original, tools_tokens, covered)
+            drop, boundary, est_size = size_layout(conversation_id, turn, original, tools_chars, covered, model)
         else:
             drop = stepped_drop(turn, cfg.proxy.trim_trigger_user_turns, cfg.proxy.trim_keep_user_turns)
             summary = orch.session_summary(conversation_id) if drop else None
@@ -339,6 +348,9 @@ def build_router(orch: Orchestrator) -> APIRouter:
         else:
             ctx = BuiltContext("", 0)
         plan = TurnPlan(drop, ctx, covered, boundary=boundary, base=base, est_size=est_size)
+        # Decided once per turn so the model doesn't switch modes between tool-call steps.
+        plan.think, plan.think_reason = thinking.decide(cfg.thinking.mode, client_think, user_text,
+                                                        cfg.thinking.simple_max_words)
         orch.record_usage(list(ctx.included) + list(base.fingerprints if base else ()))  # once per turn
         if cfg.compression.enabled:
             plan.frozen = frozen_digests(conversation_id, drop, boundary, drop_user_turns(original, drop))
@@ -358,9 +370,9 @@ def build_router(orch: Orchestrator) -> APIRouter:
         messages = original
         if isinstance(user_text, str):
             turn = sum(1 for m in original if m.get("role") == "user")
-            tools_tokens = estimate_tokens(json.dumps(body["tools"], ensure_ascii=False)) \
-                if body.get("tools") else 0
-            plan = plan_for(conversation_id, turn, user_text, original, tools_tokens)
+            tools_chars = len(json.dumps(body["tools"], ensure_ascii=False)) if body.get("tools") else 0
+            plan = plan_for(conversation_id, turn, user_text, original, tools_chars, body.get("think"),
+                            str(body.get("model") or ""))
             info.update(user_text=user_text, user_index_original=uidx, turn=turn, plan=plan)
             messages = drop_user_turns(original, plan.drop)
             info["trimmed"] = len(original) - len(messages)
@@ -390,6 +402,8 @@ def build_router(orch: Orchestrator) -> APIRouter:
             info["memory_tokens"] = plan.ctx.token_estimate
             info["memory_ids"] = plan.ctx.included
         out["messages"] = messages
+        if plan is not None and plan.think is not thinking.KEEP:
+            out["think"] = plan.think
 
         if orch.config.ollama.primary.num_ctx:
             opts = dict(out.get("options") or {})
@@ -397,6 +411,8 @@ def build_router(orch: Orchestrator) -> APIRouter:
             out["options"] = opts
         info["total_context_tokens"] = sum(
             estimate_tokens(m.get("content", "")) for m in messages if isinstance(m.get("content"), str))
+        info["prompt_chars"] = sum(len(m["content"]) for m in messages if isinstance(m.get("content"), str)) \
+            + (len(json.dumps(out["tools"], ensure_ascii=False)) if out.get("tools") else 0)
         return out, info
 
     async def finalize(body: dict, info: dict, conversation_id: str, request_id: str,
@@ -423,12 +439,18 @@ def build_router(orch: Orchestrator) -> APIRouter:
                "tool_tokens_saved": info.get("tool_tokens_saved", 0),
                "memory_flags": len(stripper.flags) if stripper else 0,
                "tool_calls_in_response": len(tool_calls),
+               "thinking": ("client" if not plan or plan.think is thinking.KEEP else
+                            ("on" if plan.think else "off")),
+               "thinking_reason": plan.think_reason if plan else "",
                "total_request_time": round(time.perf_counter() - t0, 3)}
         if first_token_at is not None:
             rec["time_to_first_token"] = round(first_token_at - t0, 3)
         rec.update(Metrics.from_ollama(final))
         if error:
             rec["error"] = error
+        elif final.get("prompt_eval_count"):
+            orch.calibrator.observe(str(body.get("model") or ""), info.get("prompt_chars", 0),
+                                    final.get("prompt_eval_count"))
         orch.metrics.record_request(rec)
         (plog.error if error else plog.info)("proxied chat", extra=rec)
 
@@ -442,6 +464,14 @@ def build_router(orch: Orchestrator) -> APIRouter:
         original = body.get("messages") or []
         uidx = info.get("user_index_original")
         events = tool_events_since(original, uidx) if uidx is not None else []
+        if uidx is not None:
+            users = [i for i, m in enumerate(original[:uidx]) if m.get("role") == "user"]
+            if users:
+                prev_q = original[users[-1]].get("content")
+                prev_a = next((m.get("content") for m in reversed(original[users[-1] + 1:uidx])
+                               if m.get("role") == "assistant" and m.get("content")), None)
+                if isinstance(prev_q, str) and isinstance(prev_a, str):
+                    orch.capture_correction(conversation_id, info.get("turn", 0), info["user_text"], prev_q, prev_a)
         try:
             task = orch.record_turn(conversation_id=conversation_id, user_message=info["user_text"],
                                     assistant_response=content, tool_events=events, source="openclaw",

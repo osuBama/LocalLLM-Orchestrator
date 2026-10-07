@@ -507,3 +507,57 @@ def render_markdown(report: dict) -> str:
               "recorded history, so every variant sees the same conversation; the client's real system prompt "
               "and tool schemas are not in the logs unless passed with --client-system."]
     return "\n".join(lines) + "\n"
+
+
+# ------------------------------------------------------- golden candidates
+def accept_candidate(db, candidate_id: int, golden_path: Path, *, expect: list[str] | None = None,
+                     forbid: list[str] | None = None, name: str | None = None) -> dict:
+    """Turn a captured correction into a golden case appended to golden.yaml.
+
+    The case replays the session up to just before the question that was answered
+    wrongly, asks it again, and checks for what the correction said. Appends (keeps
+    comments in the file), validates, and rolls back if the result does not load.
+    """
+    cand = next((c for c in db.candidates(status=None, limit=100000) if c["id"] == candidate_id), None)
+    if cand is None:
+        raise ValueError(f"no candidate #{candidate_id}")
+    if cand["status"] != "pending":
+        raise ValueError(f"candidate #{candidate_id} is already {cand['status']}")
+    expect = list(expect or []) or list(cand["suggested_expect"])
+    forbid = list(forbid or [])
+    if not expect and not forbid:
+        raise ValueError("no expectation suggested for this candidate; pass --expect (and/or --forbid)")
+    name = name or f"correction-{candidate_id}"
+    case = {"name": name, "session": cand["conversation_id"], "upto_turn": max(0, cand["turn"] - 2),
+            "question": cand["question"]}
+    if expect:
+        case["expect_all"] = expect
+    if forbid:
+        case["forbid"] = forbid
+    GoldenCase.model_validate(case)
+
+    golden_path = Path(golden_path)
+    golden_path.parent.mkdir(parents=True, exist_ok=True)
+    original = golden_path.read_text(encoding="utf-8") if golden_path.exists() else None
+    if original is not None:
+        existing = yaml.safe_load(original) or {}
+        if any(c.get("name") == name for c in existing.get("cases") or []):
+            raise ValueError(f"a case named {name!r} already exists in {golden_path}")
+    block = yaml.safe_dump([case], allow_unicode=True, sort_keys=False, width=100)
+    block = "".join("  " + line if line.strip() else line for line in block.splitlines(True))
+    comment = f"  # from correction #{candidate_id}: {cand['correction'][:80]!r}\n".replace("\n", " ").rstrip() + "\n"
+    if original is None or not (yaml.safe_load(original) or {}).get("cases"):
+        text = "cases:\n" + comment + block
+    else:
+        text = original.rstrip("\n") + "\n\n" + comment + block
+    golden_path.write_text(text, encoding="utf-8")
+    try:
+        load_golden(golden_path)
+    except Exception as e:
+        if original is None:
+            golden_path.unlink()
+        else:
+            golden_path.write_text(original, encoding="utf-8")
+        raise ValueError(f"golden file would not validate, left unchanged: {e}") from e
+    db.set_candidate_status(candidate_id, "accepted", name)
+    return {"accepted": candidate_id, "case": case, "file": str(golden_path)}
