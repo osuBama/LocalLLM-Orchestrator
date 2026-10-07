@@ -410,6 +410,8 @@ def build_router(orch: Orchestrator) -> APIRouter:
             info["memory_tokens"] = plan.ctx.token_estimate
             info["memory_ids"] = plan.ctx.included
         out["messages"] = messages
+        if orch.capture is not None:
+            orch.capture[conversation_id] = copy.deepcopy(messages)
         if plan is not None and plan.think is not thinking.KEEP:
             out["think"] = plan.think
 

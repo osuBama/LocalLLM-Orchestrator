@@ -80,6 +80,9 @@ class Orchestrator:
         self._turns: dict[str, int] = {}
         self._bases: OrderedDict[tuple, StableSnapshot] = OrderedDict()
         self.last_request_at = time.time()
+        # Evaluation only: when set to a dict, the proxy records the exact messages sent to the
+        # primary per conversation (for tracing where a golden answer's evidence was).
+        self.capture: dict | None = None
         from .consolidation import Consolidator
         self.consolidator = Consolidator(self)
         self.worker.idle_hook = self.idle_work

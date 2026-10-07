@@ -135,6 +135,15 @@ class EvalRun(BaseModel):
     golden_only: bool = False
 
 
+class GenerateRequest(BaseModel):
+    last: int = Field(5, ge=1, le=100)
+    gap: int = Field(6, ge=2, le=100)
+    per_session: int = Field(5, ge=1, le=50)
+    limit: int = Field(30, ge=1, le=200)
+    use_model: bool = True
+    mode: str = Field("both", pattern="^(later|new-session|both)$")
+
+
 class CandidateAccept(BaseModel):
     expect: list[str] = Field(default_factory=list)
     forbid: list[str] = Field(default_factory=list)
@@ -324,6 +333,19 @@ def build_ui_router(orch) -> APIRouter:
                                     forbid=body.forbid or None, name=body.name or None)
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
+
+    @router.post("/ui/api/candidates/generate")
+    async def generate_candidates(req: GenerateRequest):
+        from .evaluation import load_recorded_sessions
+        from .eval_generate import generate
+        recorded = load_recorded_sessions(cfg.conversations_dir)
+        min_turns = req.gap if req.mode != "new-session" else 1
+        pick = [s for s in recorded.values() if len(s.turns) > min_turns][-req.last:]
+        if not pick:
+            raise HTTPException(400, f"No recorded sessions longer than {req.gap} turns yet.")
+        async with orch.worker.lock:            # one memory-GPU job at a time
+            return await generate(orch.db, pick, memory_client=orch.memory_client if req.use_model else None,
+                                  gap=req.gap, per_session=req.per_session, limit=req.limit, mode=req.mode)
 
     @router.post("/ui/api/candidates/{cid}/dismiss")
     async def dismiss(cid: int):

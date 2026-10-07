@@ -20,6 +20,7 @@ from collections import OrderedDict
 import httpx
 import numpy as np
 
+from .conversation_logger import ConversationLogger
 from .flags import remove_flag_tags
 from .util import estimate_tokens, head_tail
 
@@ -161,6 +162,10 @@ class Indexer:
         self.orch = orch
         self.embedder = embedder
         self.index = VectorIndex(orch.db, embedder.model)
+        # Evaluation controls (None = normal operation): only excerpts from before `cutoff`,
+        # and never from `exclude_conversations`.
+        self.cutoff = None
+        self.exclude_conversations: set[str] = set()
 
     def _memory_docs(self) -> dict[str, str]:
         docs = {}
@@ -186,13 +191,13 @@ class Indexer:
         return len(stale)
 
     def add_history(self, conversation_id: str, turn: int, user: str, assistant: str,
-                    tool_events: list[dict]) -> str | None:
+                    tool_events: list[dict], created_at: str | None = None) -> str | None:
         cfg = self.orch.config.history_recall
         if not (cfg.enabled and user and assistant and turn):
             return None
         key = f"{conversation_id}:{turn}"
         text = history_chunk_text(user, assistant, tool_events, cfg.chunk_chars)
-        self.orch.db.add_history_chunk(key, conversation_id, turn, text)
+        self.orch.db.add_history_chunk(key, conversation_id, turn, text, created_at)
         return key
 
     async def sync_history(self, limit: int = 256) -> int:
@@ -208,15 +213,19 @@ class Indexer:
         self.index.invalidate("history")
         return len(todo)
 
-    def backfill_history_from_logs(self) -> int:
-        """Create chunks for every recorded turn in raw JSONL (embedding happens in sync_history)."""
+    def backfill_history_from_logs(self, conversations_dir=None) -> int:
+        """Create chunks for every recorded turn in raw JSONL (embedding happens in sync_history).
+
+        Chunks keep the turn's original timestamp, so time-bounded recall (evaluation) works.
+        """
         counters: dict[str, int] = {}
         n = 0
-        for t in self.orch.conv_log.iter_interactions():
+        logs = self.orch.conv_log if conversations_dir is None else ConversationLogger(conversations_dir)
+        for t in logs.iter_interactions():
             cid = t["conversation_id"]
             counters[cid] = counters.get(cid, 0) + 1
             if self.add_history(cid, counters[cid], t.get("user_message", ""), t.get("assistant_response", ""),
-                                t.get("tool_events") or []):
+                                t.get("tool_events") or [], created_at=t.get("timestamp") or None):
                 n += 1
         return n
 
@@ -244,6 +253,13 @@ class Indexer:
                 continue
             if c["conversation_id"] == conversation_id and c["turn"] > in_prompt_after_turn:
                 continue
+            if c["conversation_id"] in self.exclude_conversations:
+                continue
+            if self.cutoff is not None:
+                from .eval_asof import parse_ts
+                ts = parse_ts(c["created_at"])
+                if ts is None or ts >= self.cutoff:
+                    continue
             out.append({"key": k, "conversation_id": c["conversation_id"], "turn": c["turn"],
                         "date": (c["created_at"] or "")[:10], "similarity": round(sim, 3), "text": c["text"]})
             if len(out) >= cfg.top_k:

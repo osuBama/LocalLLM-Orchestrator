@@ -266,8 +266,19 @@ td.fail { color: var(--bad); }
     <div class="row" style="margin-top:10px"><button class="btn" id="ev-compare" disabled>Compare selected</button></div></div>
   <div id="ev-cmp"></div>
 
-  <h2>Corrections waiting for review</h2>
-  <p class="hint">When you correct the model, the question can become a golden test. Accept to add it to evals/golden.yaml.</p>
+  <h2>Questions waiting for review</h2>
+  <p class="hint">Corrections you made, and questions generated from recorded sessions. Accepted ones are added to evals/golden.yaml.</p>
+  <div class="panel">
+    <div class="row">
+      <span>Generate from the last</span><input type="number" id="gen-last" value="5" min="1" max="100" style="width:64px" aria-label="Sessions"><span>sessions, asking</span>
+      <input type="number" id="gen-gap" value="6" min="2" max="100" style="width:64px" aria-label="Gap"><span>turns after a value was mentioned, up to</span>
+      <input type="number" id="gen-per" value="5" min="1" max="50" style="width:64px" aria-label="Per session"><span>per session.</span>
+      <label class="inline">Ask them <select id="gen-mode"><option value="both">both ways</option><option value="later">later in the same session</option><option value="new-session">in a new conversation</option></select></label>
+      <label class="inline"><input type="checkbox" id="gen-model" checked> Word them with the memory model</label>
+      <button class="btn go" id="gen-go">Generate questions</button>
+    </div>
+  </div>
+  <div class="row" id="cand-bulk" hidden style="margin-bottom:10px"><button class="btn" id="cand-accept-all">Accept all shown</button><span class="hint" id="cand-count" style="margin:0"></span></div>
   <div id="ev-cands"></div>
 </section>
 </main>
@@ -575,36 +586,80 @@ $("#ev-compare").onclick = ev => busy(ev.target, async () => {
   const rows = [];
   for (const rep of data) for (const [v, r] of Object.entries(rep.variants)) rows.push({ label: `${rep.started.slice(5).replace("_", " ")} ${v}`, rep, v, r });
   const maxTok = Math.max(1, ...rows.map(x => x.r.processed_tokens || 0));
+  const hasCost = rows.some(x => x.r.turns);
   const bars = (title, fn) => `<h3>${title}</h3>${rows.map(fn).join("")}`;
   const cases = [...new Set(data.flatMap(d => (d.golden || []).map(g => g.case)))];
   $("#ev-cmp").innerHTML = `<div class="panel">
-    ${bars("Processed prompt tokens (lower is cheaper)", x => `<div class="hbar"><span>${esc(x.label)}</span><span class="track"><span class="fill" style="width:${100 * (x.r.processed_tokens || 0) / maxTok}%"></span></span><span>${fmt(x.r.processed_tokens)}</span></div>`)}
+    ${!hasCost ? `<p class="hint">These runs only asked golden questions, so there are no cost numbers. Include sessions (“Last sessions” above 0) to measure cost.</p>` : bars("Processed prompt tokens (lower is cheaper)", x => `<div class="hbar"><span>${esc(x.label)}</span><span class="track"><span class="fill" style="width:${100 * (x.r.processed_tokens || 0) / maxTok}%"></span></span><span>${fmt(x.r.processed_tokens)}</span></div>`)}
     ${rows.some(x => x.r.golden_total) ? bars("Golden pass rate (bracket = 95% interval)", x => {
       if (!x.r.golden_total) return `<div class="hbar"><span>${esc(x.label)}</span><span class="hint">no golden questions</span><span></span></div>`;
       const rate = x.r.golden_passed / x.r.golden_total, ci = x.r.golden_pass_rate_ci95 || [rate, rate];
       return `<div class="hbar"><span>${esc(x.label)}</span><span class="track"><span class="fill m" style="width:${rate * 100}%"></span><span class="ci" style="left:${ci[0] * 100}%;width:${(ci[1] - ci[0]) * 100}%"></span></span><span>${x.r.golden_passed}/${x.r.golden_total}</span></div>`;
     }) : ""}
-    <h3>Details</h3><div class="scroll"><table><tr><th>Run and variant</th><th class="n">Turns</th><th class="n">Processed tokens</th><th class="n">Prefill s</th><th class="n">Peak context</th><th class="n">Over window</th><th class="n">Cache hit</th><th class="n">Memory tok/turn</th><th class="n">Tool tokens saved</th><th class="n">Golden</th></tr>
-    ${rows.map(x => `<tr><td>${esc(x.label)}</td><td class="n">${fmt(x.r.turns)}</td><td class="n">${fmt(x.r.processed_tokens)}</td><td class="n">${fmt(x.r.prefill_s, 1)}</td><td class="n">${fmt(x.r.max_context_tokens)}</td><td class="n ${x.r.turns_over_ctx ? "flag" : ""}">${fmt(x.r.turns_over_ctx)}</td><td class="n">${pct(x.r.est_cache_hit)}</td><td class="n">${fmt(x.r.avg_memory_tokens)}</td><td class="n">${fmt(x.r.tool_tokens_saved)}</td><td class="n">${x.r.golden_total ? `${x.r.golden_passed}/${x.r.golden_total}` : "–"}</td></tr>`).join("")}</table></div>
+    ${!hasCost ? "" : `<h3>Details</h3><div class="scroll"><table><tr><th>Run and variant</th><th class="n">Turns</th><th class="n">Processed tokens</th><th class="n">Prefill s</th><th class="n">Peak context</th><th class="n">Over window</th><th class="n">Cache hit</th><th class="n">Memory tok/turn</th><th class="n">Tool tokens saved</th><th class="n">Golden</th></tr>
+    ${rows.map(x => `<tr><td>${esc(x.label)}</td><td class="n">${fmt(x.r.turns)}</td><td class="n">${fmt(x.r.processed_tokens)}</td><td class="n">${fmt(x.r.prefill_s, 1)}</td><td class="n">${fmt(x.r.max_context_tokens)}</td><td class="n ${x.r.turns_over_ctx ? "flag" : ""}">${fmt(x.r.turns_over_ctx)}</td><td class="n">${pct(x.r.est_cache_hit)}</td><td class="n">${fmt(x.r.avg_memory_tokens)}</td><td class="n">${fmt(x.r.tool_tokens_saved)}</td><td class="n">${x.r.golden_total ? `${x.r.golden_passed}/${x.r.golden_total}` : "–"}</td></tr>`).join("")}</table></div>`}
     ${cases.length ? `<h3>Golden questions</h3><div class="scroll"><table><tr><th>Question</th>${rows.map(x => `<th>${esc(x.label)}</th>`).join("")}</tr>
-      ${cases.map(c => `<tr><td>${esc(c)}</td>${rows.map(x => { const gs = (x.rep.golden || []).filter(g => g.case === c && g.variant === x.v); if (!gs.length) return "<td>–</td>"; const ok = gs.filter(g => g.passed).length; const bad = gs.find(g => !g.passed); return `<td class="${ok === gs.length ? "pass" : "fail"}" title="${esc(bad ? bad.problems.join("; ") : "")}">${gs.length > 1 ? `${ok}/${gs.length}` : ok ? "pass" : "fail"}</td>`; }).join("")}</tr>`).join("")}</table></div>` : ""}
+      ${cases.map(c => `<tr><td>${esc(c)}</td>${rows.map(x => { const gs = (x.rep.golden || []).filter(g => g.case === c && g.variant === x.v); if (!gs.length) return "<td>–</td>"; const ok = gs.filter(g => g.passed).length; const bad = gs.find(g => !g.passed); const why = (bad || gs[0]).diagnosis; return `<td class="${ok === gs.length ? "pass" : "fail"}" title="${esc([bad ? bad.problems.join("; ") : "", why ? "diagnosis: " + why.replaceAll("_", " ") : ""].filter(Boolean).join(" | "))}">${gs.length > 1 ? `${ok}/${gs.length}` : ok ? "pass" : "fail"}</td>`; }).join("")}</tr>`).join("")}</table></div>` : ""}
+    ${data.some(d => d.diagnosis && Object.values(d.diagnosis).some(x => Object.values(x.counts).some(n => n))) ? (() => {
+      const LBL = { answered_from_prompt: "From the prompt", answered_without_evidence: "Without evidence", model_missed: "Model missed it",
+                    not_retrieved: "Not retrieved", lost_from_session: "Lost from session", never_available: "Never available" };
+      const used = Object.keys(LBL).filter(c => data.some(d => Object.values(d.diagnosis || {}).some(x => x.counts[c])));
+      return `<h3>Why answers passed or failed</h3>
+      <p class="hint">Where the expected answer was when the question was asked. Failures to the right point at what to fix: the model, retrieval, trimming, or memory extraction.</p>
+      <div class="scroll"><table><tr><th>Run and variant</th>${used.map(c => `<th class="n">${LBL[c]}</th>`).join("")}<th class="n">Memory reached the prompt</th></tr>
+      ${data.flatMap(d => Object.entries(d.diagnosis || {}).map(([v, x]) => `<tr><td>${esc(d.started.slice(5).replace("_", " "))} ${esc(v)}</td>
+        ${used.map(c => `<td class="n ${x.counts[c] && !c.startsWith("answered") ? "fail" : ""}">${x.counts[c] || 0}</td>`).join("")}
+        <td class="n">${x.memory_retrieval.rate == null ? "–" : `${x.memory_retrieval.reached_prompt}/${x.memory_retrieval.available}`}</td></tr>`)).join("")}</table></div>`;
+    })() : ""}
+    ${data.some(d => d.paired && Object.keys(d.paired).length) ? `<h3>Paired against each run's baseline</h3>
+      <p class="hint">Same questions and turns for both variants; only disagreements count. p &lt; 0.05: unlikely to be chance.</p>
+      <div class="scroll"><table><tr><th>Run and variant</th><th>Compared with</th><th class="n">Both pass</th><th class="n">Only this passes</th><th class="n">Only baseline passes</th><th class="n">p</th><th class="n">Median tokens</th><th class="n">Turns cheaper</th></tr>
+      ${data.flatMap(d => Object.entries(d.paired || {}).map(([v, x]) => `<tr><td>${esc(d.started.slice(5).replace("_", " "))} ${esc(v)}</td><td>${esc(x.vs)}</td>
+        <td class="n">${x.both_pass}/${x.golden_pairs}</td><td class="n">${x.only_this_passes}</td><td class="n">${x.only_baseline_passes}</td>
+        <td class="n ${x.mcnemar_p != null && x.mcnemar_p < 0.05 ? (x.only_this_passes > x.only_baseline_passes ? "pass" : "fail") : ""}">${x.mcnemar_p == null ? "–" : x.mcnemar_p.toFixed(3)}</td>
+        <td class="n">${x.median_token_ratio == null ? "–" : ((x.median_token_ratio - 1) * 100 >= 0 ? "+" : "") + Math.round((x.median_token_ratio - 1) * 100) + "%"}</td>
+        <td class="n">${x.turns_cheaper}/${x.turn_pairs}</td></tr>`)).join("")}</table></div>` : ""}
+    ${data.filter(d => d.options && d.options.memory && d.options.memory !== "asof").map(d => `<p class="flag">${esc(d.started)}: memory "${esc(d.options.memory)}" was used, so memory variants may have known answers from the future.</p>`).join("")}
     ${data.flatMap(d => (d.regressions?.flags || []).map(f => `<p class="flag">${esc(d.started)}: ${esc(f)}</p>`)).join("")}
   </div>`;
 });
 async function loadCandidates() {
   let r; try { r = await api("/eval/candidates"); } catch (e) { return; }
-  $("#ev-cands").innerHTML = r.candidates.map(c => `<div class="panel b" data-c="${c.id}">
-    <dl class="facts"><dt>Asked</dt><dd>${esc(c.question)}</dd><dt>Answered</dt><dd>${esc(c.wrong_answer.slice(0, 300))}</dd><dt>Your correction</dt><dd>${esc(c.correction)}</dd></dl>
+  $("#cand-bulk").hidden = !r.candidates.length;
+  $("#cand-count").textContent = r.candidates.length ? `${r.candidates.length} waiting` : "";
+  $("#ev-cands").innerHTML = r.candidates.map(c => `<div class="panel ${c.kind === "generated" ? "a" : "b"}" data-c="${c.id}">
+    ${c.kind === "generated"
+      ? `<dl class="facts"><dt>Question</dt><dd>${esc(c.question)}</dd><dt>Source</dt><dd>${esc(c.context)}</dd><dt>Asked</dt><dd>${c.as_of ? `in a new conversation, ${esc(c.as_of.replace("T", " ").slice(0, 16))} (only memory can answer)` : `after turn ${c.upto_turn} of ${esc(c.conversation_id)}`}</dd></dl>`
+      : `<dl class="facts"><dt>Asked</dt><dd>${esc(c.question)}</dd><dt>Answered</dt><dd>${esc(c.wrong_answer.slice(0, 300))}</dd><dt>Your correction</dt><dd>${esc(c.correction)}</dd></dl>`}
     <div class="row" style="margin-top:10px"><label class="inline">Answer must contain <input type="text" data-f="expect" value="${esc(c.suggested_expect.join(", "))}" size="24"></label>
       <label class="inline">must not contain <input type="text" data-f="forbid" value="${esc((c.suggested_forbid || []).join(", "))}" size="18"></label>
       <button class="btn go" data-a="accept">Accept</button><button class="btn quiet" data-a="dismiss">Dismiss</button></div></div>`).join("")
-    || `<p class="hint">Nothing waiting. Corrections like “no, it's 11435” appear here.</p>`;
+    || `<p class="hint">Nothing waiting. Corrections like “no, it's 11435” appear here, and so do generated questions.</p>`;
   $$("#ev-cands [data-c]").forEach(p => {
     const id = p.dataset.c, list = f => $(`[data-f=${f}]`, p).value.split(",").map(s => s.trim()).filter(Boolean);
     $("[data-a=accept]", p).onclick = ev => busy(ev.target, async () => { const r = await post(`/ui/api/candidates/${id}/accept`, { expect: list("expect"), forbid: list("forbid") }); toast(`Added ${r.case.name} to golden.yaml`); loadCandidates(); });
     $("[data-a=dismiss]", p).onclick = ev => busy(ev.target, async () => { await post(`/ui/api/candidates/${id}/dismiss`); loadCandidates(); });
   });
 }
+
+$("#gen-go").onclick = ev => busy(ev.target, async () => {
+  toast("Generating questions on the memory GPU…");
+  const r = await post("/ui/api/candidates/generate", { last: +$("#gen-last").value, gap: +$("#gen-gap").value,
+    per_session: +$("#gen-per").value, use_model: $("#gen-model").checked, mode: $("#gen-mode").value });
+  toast(`${r.created.length} new questions (${r.by_wording.model} worded by the model, ${r.by_wording["fill-in-the-blank"]} fill-in-the-blank)${r.skipped_duplicates ? `, ${r.skipped_duplicates} already existed` : ""}`);
+  loadCandidates();
+});
+$("#cand-accept-all").onclick = ev => busy(ev.target, async () => {
+  const panels = $$("#ev-cands [data-c]");
+  if (!confirm(`Add all ${panels.length} questions to golden.yaml with their current checks?`)) return;
+  let ok = 0, skipped = 0;
+  for (const p of panels) {
+    const list = f => $(`[data-f=${f}]`, p).value.split(",").map(s => s.trim()).filter(Boolean);
+    try { await post(`/ui/api/candidates/${p.dataset.c}/accept`, { expect: list("expect"), forbid: list("forbid") }); ok++; }
+    catch { skipped++; }
+  }
+  toast(`Added ${ok} questions${skipped ? `; ${skipped} skipped (no check to grade by)` : ""}`); loadCandidates();
+});
 
 /* ------------------------------------------------------------ start */
 refreshStatus(); setInterval(() => { if (!document.hidden) refreshStatus(); }, 5000);

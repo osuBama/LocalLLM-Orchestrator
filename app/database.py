@@ -108,6 +108,10 @@ CREATE TABLE IF NOT EXISTS golden_candidates (
     correction TEXT NOT NULL,
     suggested_expect TEXT NOT NULL DEFAULT '[]',
     suggested_forbid TEXT NOT NULL DEFAULT '[]',
+    kind TEXT NOT NULL DEFAULT 'correction',
+    upto_turn INTEGER,
+    context TEXT NOT NULL DEFAULT '',
+    as_of TEXT,
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','accepted','dismissed')),
     case_name TEXT
 );
@@ -147,6 +151,13 @@ class Database:
             gcols = {r["name"] for r in c.execute("PRAGMA table_info(golden_candidates)")}
             if gcols and "suggested_forbid" not in gcols:  # migration from 0.10/0.11
                 c.execute("ALTER TABLE golden_candidates ADD COLUMN suggested_forbid TEXT NOT NULL DEFAULT '[]'")
+            if gcols and "kind" not in gcols:              # migration from <= 0.14
+                c.execute("ALTER TABLE golden_candidates ADD COLUMN kind TEXT NOT NULL DEFAULT 'correction'")
+                c.execute("ALTER TABLE golden_candidates ADD COLUMN upto_turn INTEGER")
+                c.execute("ALTER TABLE golden_candidates ADD COLUMN context TEXT NOT NULL DEFAULT ''")
+            gcols = {r["name"] for r in c.execute("PRAGMA table_info(golden_candidates)")}
+            if gcols and "as_of" not in gcols:
+                c.execute("ALTER TABLE golden_candidates ADD COLUMN as_of TEXT")
             if "priority" not in cols:  # migration from 0.2.0
                 c.execute("ALTER TABLE memory_tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
                 c.execute("ALTER TABLE memory_tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'extract'")
@@ -358,8 +369,8 @@ class Database:
     def add_candidate(self, conversation_id: str, turn: int, question: str, wrong_answer: str,
                       correction: str, suggested: list[str], suggested_forbid: list[str] | None = None) -> int:
         with self.connect() as c:
-            dup = c.execute("SELECT id FROM golden_candidates WHERE conversation_id=? AND turn=?",
-                            (conversation_id, turn)).fetchone()
+            dup = c.execute("SELECT id FROM golden_candidates WHERE kind='correction' AND conversation_id=? "
+                            "AND turn=?", (conversation_id, turn)).fetchone()
             if dup:
                 return int(dup["id"])
             cur = c.execute(
@@ -367,6 +378,23 @@ class Database:
                        correction, suggested_expect, suggested_forbid) VALUES (?,?,?,?,?,?,?,?)""",
                 (now_iso(), conversation_id, turn, question, wrong_answer, correction,
                  json.dumps(suggested, ensure_ascii=False), json.dumps(suggested_forbid or [], ensure_ascii=False)))
+            return int(cur.lastrowid)
+
+    def add_generated_candidate(self, conversation_id: str, upto_turn: int, question: str, expect: str,
+                                context: str, as_of: str | None = None) -> int | None:
+        """A generated golden question. None if one already exists for this session, answer and kind."""
+        with self.connect() as c:
+            dup = c.execute("SELECT id FROM golden_candidates WHERE kind='generated' AND conversation_id=? "
+                            "AND suggested_expect=? AND (as_of IS NULL) = (? IS NULL)",
+                            (conversation_id, json.dumps([expect]), as_of)).fetchone()
+            if dup:
+                return None
+            cur = c.execute(
+                """INSERT INTO golden_candidates (created_at, conversation_id, turn, question, wrong_answer,
+                       correction, suggested_expect, suggested_forbid, kind, upto_turn, context, as_of)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (now_iso(), conversation_id, upto_turn + 1, question, "", "", json.dumps([expect]), "[]",
+                 "generated", upto_turn, context, as_of))
             return int(cur.lastrowid)
 
     def candidates(self, status: str | None = "pending", limit: int = 100) -> list[dict]:
@@ -407,10 +435,12 @@ class Database:
             return [(r["key"], r["vec"], r["dim"]) for r in c.execute(
                 "SELECT key, vec, dim FROM vectors WHERE kind=? AND model=? ORDER BY key", (kind, model))]
 
-    def add_history_chunk(self, key: str, conversation_id: str, turn: int, text: str) -> bool:
+    def add_history_chunk(self, key: str, conversation_id: str, turn: int, text: str,
+                          created_at: str | None = None) -> bool:
         with self.connect() as c:
             return c.execute("INSERT OR IGNORE INTO history_chunks (key, conversation_id, turn, created_at, text) "
-                             "VALUES (?,?,?,?,?)", (key, conversation_id, turn, now_iso(), text)).rowcount > 0
+                             "VALUES (?,?,?,?,?)",
+                             (key, conversation_id, turn, created_at or now_iso(), text)).rowcount > 0
 
     def history_chunks(self, keys: list[str] | None = None) -> dict[str, dict]:
         with self.connect() as c:

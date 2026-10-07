@@ -527,6 +527,7 @@ ai memory validate | backup | rebuild [--replay [--reset]] | restore <backup-dir
 ai memory consolidate [--dry-run] | review
 ai eval sessions | ai eval run [--variant a,b,…] [--sessions …] [--golden …] [--max-turns N]
 ai eval candidates [--all] | ai eval accept <id> [--expect X] [--forbid Y] | ai eval dismiss <id>
+ai eval generate [--mode later|new-session|both] [--last N] [--gap 6] [--no-model] [--accept-all]
 ```
 
 `ai memory context "prompt"` shows exactly what would be injected for a prompt. `rebuild` alone
@@ -598,6 +599,38 @@ unchanged if the result wouldn't load). The case replays that recorded session u
 question and asks it again. Over time your golden set becomes a record of what actually went wrong,
 which is the most useful thing it can test. Turn it off with `conversation.capture_corrections: false`.
 
+### 12.1c Generated golden questions
+
+Writing questions by hand is the bottleneck, so the harness can propose them from your recorded sessions:
+
+```
+ai eval generate                          # last 5 sessions, both kinds, worded by the memory model
+ai eval generate --mode new-session --last 20 --per-session 3
+ai eval generate --no-model               # fill-in-the-blank only, no model needed
+```
+
+The console has the same controls in the Evals tab. **How it picks facts:** specific values (ports, error
+codes, host names, paths, versions, model tags, IPs) that are rare in the session. Nothing is generated from
+values mentioned more than twice or from trivial numbers. Two kinds of question:
+
+- **Later in the same session:** the value is not mentioned again for at least `--gap` turns (6), and the
+  question is asked after that gap. Depending on session length and settings, the answer is still in the
+  prompt (tests the model's attention), trimmed away (tests summaries and memory), or in compressed tool
+  output (tests digests). The diagnosis (§12.3c) shows which.
+- **In a new conversation:** asked at the start of a fresh conversation an hour after the source session
+  ended, with memory and history as of then. Only memory extraction or history recall can answer, so this is
+  the real cross-session test.
+
+**Wording:** the memory model writes the question the way you'd ask it. Code checks that it doesn't contain
+the answer and is a real question, and the model can mark an excerpt as too vague. Anything that fails
+becomes a fill-in-the-blank question built from the excerpt, which is always valid. Every question becomes a
+**candidate** next to your captured corrections. Review them in the console (with *Accept all shown* for
+speed) or with `ai eval candidates` / `accept` / `dismiss`. `--accept-all` skips review. The same value from
+the same session is never proposed twice.
+
+Golden cases can now also have `as_of: <timestamp>` instead of `session` or `turns`: a fresh conversation at
+that moment. That is how *new conversation* questions are stored, and you can write such cases by hand too.
+
 ### 12.2 Variants
 
 A variant is a set of `config.yaml` overrides with dotted keys. `baseline` (plain Ollama behaviour:
@@ -620,15 +653,60 @@ A golden set of a dozen questions can't tell a 5-point difference from noise. Tw
 
 ### 12.3 Isolation and fairness
 
-- Each variant runs in its own workspace (`evals\runs\<timestamp>\<variant>\`) with a copy of your
-  memory (`--memory empty` to start blank) and a fresh database. Your real memory, database and logs
-  are never written. Extraction is off unless you pass `--extract`.
-- A unique marker at the start of each run's system prompt stops one variant from reusing another's
-  cached prefix. Both models are warmed up before each variant, so load time doesn't skew the first one.
-- **Stop the orchestrator server** while evaluating (the harness warns if it's running). Live traffic
-  on the same Ollama instances distorts cache and timing numbers.
+- **No knowledge from the future (`--memory asof`, the default).** Replaying an old session against
+  today's memory would let memory variants answer from facts learned *later*. Instead, each recorded
+  session and golden question starts from memory **as it was at that moment**. That's reconstructed from
+  the snapshots taken before every memory write: the state at time T is the first snapshot after T.
+  Entries created after T are removed in any case. If snapshot retention has already pruned the relevant
+  history, the case is listed as *approximate* in the report. History recall is held to the same rule: only
+  excerpts from before the question, never from the question's own session. Scripted golden questions
+  start from empty memory, since their facts are in their own turns. `--memory current` (today's memory)
+  and `--memory empty` exist for comparison; the report says which was used.
+- **Interleaved, shuffled order.** All variants are set up first, then each session and question is run on
+  every variant in a seeded random order (`--seed`, recorded in the report). No variant is systematically
+  first (cold caches) or last (warm).
+- Each variant runs in its own workspace (`evals\runs\<timestamp>\<variant>\`) with a fresh database. Your
+  real memory, database and logs are never written. Extraction is off unless you pass `--extract`.
+- A unique marker at the start of each variant's system prompt stops one variant from reusing another's
+  cached prefix.
+- **Stop the orchestrator server** while evaluating (the harness warns if it's running), or at least avoid
+  using it: live traffic on the same Ollama instances distorts cache and timing numbers.
 - Your client's real system prompt and tool schemas aren't in the logs. Pass them with
   `--client-system file.txt` for realistic absolute numbers; relative comparisons are valid either way.
+
+### 12.3b Paired comparison
+
+Variants are judged on **the same questions and the same turns**, so the report compares them pair by
+pair against the first variant, not just through two separate pass rates:
+
+- **Accuracy:** for each question (and repeat), both pass, only one passes, or neither. Only the
+  disagreements carry information, and McNemar's exact test turns them into a p-value. p < 0.05 means the
+  difference is unlikely to be chance. This detects real differences with far fewer questions than
+  comparing confidence intervals. Repeats of one question aren't fully independent, so p-values from
+  `--repeats` runs are somewhat optimistic; more distinct questions beat more repeats.
+- **Cost:** the median ratio of processed tokens per turn, and on how many turns the variant was cheaper.
+
+The console's Evals tab shows the same paired table when you compare reports.
+
+### 12.3c Why an answer passed or failed
+
+For every golden answer, the harness records the exact prompt the primary received and traces the
+expected answer (whatever the case checks with `expect_all` / `expect_any`) through the system:
+
+| Diagnosis | Meaning | Look at |
+|---|---|---|
+| Answered from the prompt | passed; the answer was in front of the model | — |
+| Answered without evidence | passed, but the answer wasn't in the prompt (known or guessed) | the question may be too easy |
+| Model missed it | failed although the answer **was in the prompt** | model, thinking, how much else is in the prompt |
+| Not retrieved | the answer was **in memory or an earlier conversation**, but didn't reach the prompt | `embeddings.min_similarity`, `history_recall.*`, memory budget |
+| Lost from the session | said **earlier in this session**, then trimmed or compressed away, and the summary didn't keep it | `trim_target_ratio`, `session.summary_max_tokens`, digests |
+| Never available | nothing the system had contained it | extraction, flags, or the question can't be answered |
+
+"Available" follows the point-in-time rules (§12.3): memory as of the question, and past conversations from
+before it. For passes, the report also lists *where* the answer came from (conversation, cached memory base,
+per-turn memory, session summary, past exchange). **Memory reached the prompt** is a retrieval score: of the
+answers that existed in memory or past conversations, how many made it into the prompt. In the console the
+same table appears when comparing reports, and hovering a cell in the per-question grid shows its diagnosis.
 
 ### 12.4 Reading the report
 
@@ -639,6 +717,7 @@ Reports go to `evals\reports\<timestamp>.md` (plus `.json` with every turn). Rul
   information. Keeping long sessions inside the window is what trimming and compression are for.
 - Among variants with no overflow, prefer the one with fewer processed tokens **only if** its golden
   pass rate is no worse.
+- When a variant loses questions, the diagnosis table (§12.3c) tells you which setting to look at first.
 - What to expect, from synthetic sessions with a 16k window (run it on your own; that's the point):
 
   | Session | baseline | `full` (size mode) |
@@ -678,6 +757,6 @@ traffic. `ai memory changes` (rejection rate), `ai memory sessions` (summary qua
   `project_id`).
 - A large second GPU could take on more: embeddings, a bigger memory model, or splitting one large
   primary model across both cards instead. That trades the memory system for raw model size.
-- Tested with fake Ollama instances (196 tests: validator, atomic writes, streaming, flag stripping,
-  trimming, compression and memory-base cache stability, consolidation guards, evaluation harness, setup helpers, thinking decisions, token calibration, correction capture, hybrid retrieval, history recall, repeat runs, the console's backend, retries…). Real-GPU behaviour (pinning, VRAM fit, a given
+- Tested with fake Ollama instances (224 tests: validator, atomic writes, streaming, flag stripping,
+  trimming, compression and memory-base cache stability, consolidation guards, evaluation harness, setup helpers, thinking decisions, token calibration, correction capture, hybrid retrieval, history recall, repeat runs, the console's backend, point-in-time memory, paired statistics, answer diagnosis, question generation, retries…). Real-GPU behaviour (pinning, VRAM fit, a given
   model's JSON quality) can only be verified on your machine (§4.5); the evaluation harness (§12) is how you do that.

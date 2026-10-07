@@ -183,6 +183,44 @@ def cmd_eval(cfg, args) -> int:
     from pathlib import Path
 
     from . import evaluation as ev
+    if args.eval_cmd == "generate":
+        from .database import Database
+        from .eval_generate import generate
+        from .ollama_client import OllamaClient
+        recorded = ev.load_recorded_sessions(cfg.conversations_dir)
+        if args.sessions:
+            pick = [recorded[x.strip()] for x in args.sessions.split(",") if x.strip() in recorded]
+        else:
+            min_turns = args.gap if args.mode != "new-session" else 1
+            pick = [s for s in recorded.values() if len(s.turns) > min_turns][-args.last:] if args.last else []
+        if not pick:
+            print(f"No recorded sessions longer than {args.gap} turns to generate from.")
+            return 2
+        db = Database(cfg.database_path)
+
+        async def go():
+            client = None if args.no_model else OllamaClient(cfg.ollama.memory)
+            try:
+                return await generate(db, pick, memory_client=client, gap=args.gap, mode=args.mode,
+                                      per_session=args.per_session, limit=args.limit, progress=print)
+            finally:
+                if client is not None:
+                    await client.aclose()
+        print(f"Generating from {len(pick)} session(s)…")
+        out = asyncio.run(go())
+        made = out["created"]
+        print(f"{len(made)} candidates ({out['by_wording']['model']} worded by the memory model, "
+              f"{out['by_wording']['fill-in-the-blank']} fill-in-the-blank); "
+              f"{out['skipped_duplicates']} already existed.")
+        if args.accept_all and made:
+            golden = Path(args.golden) if args.golden else cfg.root_dir / "evals" / "golden.yaml"
+            for c in made:
+                ev.accept_candidate(db, c["id"], golden)
+            print(f"Accepted all into {golden}")
+        elif made:
+            print("Review them with `ai eval candidates` or in the console (Evals tab).")
+        return 0
+
     if args.eval_cmd in ("candidates", "accept", "dismiss"):
         from .database import Database
         db = Database(cfg.database_path)
@@ -191,6 +229,13 @@ def cmd_eval(cfg, args) -> int:
             if not rows:
                 print("No pending candidates. They appear when you correct the model (e.g. 'no, it's X').")
             for r in rows:
+                if r.get("kind") == "generated":
+                    when = f"in a new conversation at {r['as_of']}" if r.get("as_of") else f"after turn {r['upto_turn']}"
+                    print(f"#{r['id']} [{r['status']}] generated from {r['conversation_id']}, asked {when}")
+                    print(f"   question:   {r['question'][:140]!r}")
+                    print(f"   source:     {r.get('context', '')[:140]!r}")
+                    print(f"   expect_all: {r['suggested_expect']}")
+                    continue
                 print(f"#{r['id']} [{r['status']}] {r['conversation_id']} turn {r['turn']}")
                 print(f"   asked:      {r['question'][:100]!r}")
                 print(f"   answered:   {r['wrong_answer'][:100]!r}")
@@ -311,7 +356,18 @@ def main(argv: list[str] | None = None) -> int:
     e = sp.add_parser("eval", help="evaluation harness (docs/DOCUMENTATION.md §12)")
     esp = e.add_subparsers(dest="eval_cmd", required=True)
     esp.add_parser("sessions", help="list recorded sessions available for replay")
-    s = esp.add_parser("candidates", help="corrections captured as golden-question candidates")
+    s = esp.add_parser("generate", help="generate golden-question candidates from recorded sessions")
+    s.add_argument("--sessions", help="comma-separated session ids (default: the last N long enough)")
+    s.add_argument("--last", type=int, default=5)
+    s.add_argument("--gap", type=int, default=6, help="turns between stating a value and asking about it")
+    s.add_argument("--per-session", type=int, default=5)
+    s.add_argument("--limit", type=int, default=50)
+    s.add_argument("--no-model", action="store_true", help="fill-in-the-blank questions only (no memory model)")
+    s.add_argument("--mode", choices=["later", "new-session", "both"], default="both",
+                   help="later: same session after --gap turns; new-session: a fresh conversation afterwards")
+    s.add_argument("--accept-all", action="store_true", help="add all to golden.yaml without review")
+    s.add_argument("--golden", help="golden file for --accept-all (default: evals/golden.yaml)")
+    s = esp.add_parser("candidates", help="corrections and generated questions awaiting review")
     s.add_argument("--all", action="store_true", help="include accepted/dismissed")
     s = esp.add_parser("accept", help="add a candidate to evals/golden.yaml")
     s.add_argument("id", type=int)
@@ -331,8 +387,9 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--last", type=int, default=3, help="otherwise: the last N recorded sessions (default 3)")
     s.add_argument("--min-turns", type=int, default=4, help="skip shorter sessions (default 4)")
     s.add_argument("--max-turns", type=int, help="replay at most N turns per session")
-    s.add_argument("--memory", choices=["current", "empty"], default="current",
-                   help="start each variant from a copy of current memory, or from empty memory")
+    s.add_argument("--memory", choices=["asof", "current", "empty"], default="asof",
+                   help="asof (default): memory as it was when each session/question happened (no future "
+                        "knowledge); current: today's memory; empty: none")
     s.add_argument("--extract", action="store_true", help="also run memory extraction during replay")
     s.add_argument("--think", choices=["off", "on", "default"], default="off")
     s.add_argument("--client-system", help="file with your client's real system prompt (e.g. OpenClaw's)")

@@ -83,6 +83,7 @@ class GoldenCase(BaseModel):
     session: str | None = None          # a recorded conversation id (see `ai eval sessions`)
     turns: list[TurnIn] = Field(default_factory=list)   # or a scripted session
     upto_turn: int | None = Field(None, ge=0)            # replay only the first N turns
+    as_of: str | None = None     # or: a fresh conversation at this moment (memory and history as of then)
     question: str
     expect_all: list[str] = Field(default_factory=list)
     expect_any: list[str] = Field(default_factory=list)
@@ -90,8 +91,8 @@ class GoldenCase(BaseModel):
 
     @model_validator(mode="after")
     def _check(self):
-        if self.session and self.turns:
-            raise ValueError(f"case {self.name!r}: use either session or turns, not both")
+        if sum(bool(x) for x in (self.session, self.turns, self.as_of)) > 1:
+            raise ValueError(f"case {self.name!r}: use only one of session, turns or as_of")
         if not (self.expect_all or self.expect_any or self.forbid):
             raise ValueError(f"case {self.name!r}: needs expect_all, expect_any or forbid")
         return self
@@ -107,6 +108,7 @@ class EvalTurn:
     user: str
     assistant: str
     tool_events: list[dict] = field(default_factory=list)
+    timestamp: str = ""          # when the user message was sent (recorded sessions only)
 
 
 @dataclass
@@ -121,7 +123,7 @@ def load_recorded_sessions(conversations_dir: Path) -> dict[str, EvalSession]:
     for t in ConversationLogger(conversations_dir).iter_interactions():
         s = sessions.setdefault(t["conversation_id"], EvalSession(t["conversation_id"], []))
         s.turns.append(EvalTurn(t.get("user_message", ""), t.get("assistant_response", ""),
-                                list(t.get("tool_events") or [])))
+                                list(t.get("tool_events") or []), t.get("timestamp") or ""))
     return sessions
 
 
@@ -239,6 +241,12 @@ class GoldenResult:
     processed_tokens: int | None
     total_s: float
     error: str | None = None
+    repeat: int = 0
+    memory_as_of: str | None = None
+    approximate_memory: bool = False
+    diagnosis: str | None = None          # see eval_diagnose.CATEGORIES
+    evidence_in: list = field(default_factory=list)   # where the expected answer was in the prompt
+    evidence_in_store: bool = False       # did memory / allowed past conversations contain it?
 
 
 class VariantRunner:
@@ -255,6 +263,7 @@ class VariantRunner:
         self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app),
                                         base_url="http://eval", timeout=cfg.ollama.primary.timeout_seconds + 30)
         self.marker = f"[eval-run {uuid.uuid4().hex[:10]}]"
+        self.orch.capture = {}            # record outgoing prompts for diagnosis
         self.client_system = f"{self.marker}\n{client_system}"
         self.think = think
         self.extract = extract
@@ -262,6 +271,17 @@ class VariantRunner:
     async def aclose(self) -> None:
         await self.client.aclose()
         await self.orch.aclose()
+
+    async def set_point_in_time(self, texts: dict[str, str], when, exclude: set[str]) -> None:
+        """Put this variant's memory (and history recall) in the state of a past moment."""
+        for store in self.orch.manager.stores.values():
+            store.path.write_text(texts.get(store.filename, ""), encoding="utf-8")
+        self.orch.manager.sync_db_from_markdown()
+        self.orch._bases.clear()
+        if self.orch.indexer is not None:
+            self.orch.indexer.cutoff = when
+            self.orch.indexer.exclude_conversations = set(exclude)
+            await self.orch.indexer.sync_memory()
 
     def _body(self, model: str, msgs: list[dict], options: dict) -> dict:
         body = {"model": model, "stream": False, "options": options,
@@ -322,6 +342,35 @@ class VariantRunner:
         _estimate_cache_hits(out, self.cfg.ollama.primary.num_ctx)
         return out
 
+    def _evidence_sources(self, cid: str, turns: list[EvalTurn]) -> dict[str, str]:
+        """What the system had available for this question (memory as of now, allowed history, the session)."""
+        memory = "\n".join(f"{e.title}: {e.content}" for st in self.orch.manager.stores.values()
+                           for e in st.entries(active_only=True))
+        history = ""
+        ix = self.orch.indexer
+        if ix is not None and self.cfg.history_recall.enabled:
+            from .eval_asof import parse_ts
+            for c in self.orch.db.history_chunks().values():
+                if c["conversation_id"] in ix.exclude_conversations or c["conversation_id"] == cid:
+                    continue
+                ts = parse_ts(c["created_at"])
+                if ix.cutoff is not None and (ts is None or ts >= ix.cutoff):
+                    continue
+                history += c["text"] + "\n"
+        session = "\n".join(f"{t.user}\n{t.assistant}\n" + "\n".join(
+            str(ev.get("result") or "") for ev in t.tool_events) for t in turns)
+        return {"memory": memory, "history": history, "session": session}
+
+    def _diagnose(self, g: "GoldenResult", case: GoldenCase, cid: str, sources: dict[str, str]) -> None:
+        from .eval_diagnose import diagnose, evidence_in, split_prompt
+        sent = (self.orch.capture or {}).get(cid)
+        if not sent:
+            return
+        parts = split_prompt(sent, case.question)
+        g.diagnosis, g.evidence_in = diagnose(case, g.passed, parts, memory_text=sources["memory"],
+                                              history_text=sources["history"], session_text=sources["session"])
+        g.evidence_in_store = evidence_in(case, sources["memory"]) or evidence_in(case, sources["history"])
+
     async def golden(self, case: GoldenCase, session: EvalSession, model: str,
                      max_answer_tokens: int, seed: int, repeats: int = 1) -> list[GoldenResult]:
         """Replay once, then ask `repeats` times with seeds seed, seed+1, ...
@@ -334,6 +383,7 @@ class VariantRunner:
         cid = f"eval-{self.name}-{session.id}"[:64]
         msgs = history_messages([*turns, EvalTurn(case.question, "")], final_tools=False)
         temperature = 0 if repeats <= 1 else 0.7
+        sources = self._evidence_sources(cid, turns)
         out = []
         for r in range(max(1, repeats)):
             try:
@@ -341,11 +391,13 @@ class VariantRunner:
                                                                    "temperature": temperature, "seed": seed + r})
                 answer = (data.get("message") or {}).get("content", "") or ""
                 ok, problems = grade(case, answer)
-                out.append(GoldenResult(self.name, case.name, ok, problems, answer[:2000],
-                                        rec.get("prompt_tokens"), round(dt, 3)))
+                g = GoldenResult(self.name, case.name, ok, problems, answer[:2000],
+                                 rec.get("prompt_tokens"), round(dt, 3), repeat=r)
+                self._diagnose(g, case, cid, sources)
+                out.append(g)
             except Exception as e:
                 out.append(GoldenResult(self.name, case.name, False, ["request failed"], "", None, 0.0,
-                                        f"{type(e).__name__}: {e}"))
+                                        f"{type(e).__name__}: {e}", repeat=r))
         return out
 
 
@@ -376,65 +428,138 @@ def _estimate_cache_hits(results: list[TurnResult], num_ctx: int | None = None) 
 # ------------------------------------------------------------------ driver
 async def run_eval(base: Config, *, variants: dict[str, dict], variant_names: list[str],
                    sessions: list[EvalSession], golden: list[GoldenCase], max_turns: int | None = None,
-                   memory: str = "current", extract: bool = False, think: bool | None = False,
+                   memory: str = "asof", extract: bool = False, think: bool | None = False,
                    client_system: str = DEFAULT_CLIENT_SYSTEM, max_answer_tokens: int = 512,
                    seed: int = 42, repeats: int = 1, out_dir: Path | None = None, primary_transport=None,
                    memory_transport=None, progress=print) -> dict:
-    out_dir = Path(out_dir or (base.root_dir / "evals"))
-    run_dir = out_dir / "runs" / stamp()
-    model = base.ollama.primary.model
-    recorded = None
-    turn_results: list[TurnResult] = []
-    golden_results: list[GoldenResult] = []
+    """Run every variant on every session and golden case.
 
+    Fairness:
+      * memory="asof" (default): each recorded session/case starts from memory as it was
+        at that moment (no knowledge from the future); scripted cases start empty.
+      * variants are interleaved per session/case in a seeded random order, so no
+        variant is systematically first (cold) or last (warm).
+    """
+    import random
+    from .eval_asof import empty_memory, memory_as_of, parse_ts
+
+    if memory not in ("asof", "current", "empty"):
+        raise ValueError("memory must be asof, current or empty")
     for name in variant_names:
         if name not in variants:
             raise ValueError(f"unknown variant {name!r}; known: {', '.join(variants)}")
+    out_dir = Path(out_dir or (base.root_dir / "evals"))
+    run_dir = out_dir / "runs" / stamp()
+    model = base.ollama.primary.model
+    rng = random.Random(seed)
+    turn_results: list[TurnResult] = []
+    golden_results: list[GoldenResult] = []
+    order_log: list[dict] = []
+    current_texts = {p.name: p.read_text(encoding="utf-8") for p in base.memory_dir.glob("*.md")} \
+        if base.memory_dir.exists() else {}
+    empty_texts = empty_memory(base.memory_dir)
 
-    for name in variant_names:
-        ws = run_dir / name
-        (ws / "memory").mkdir(parents=True, exist_ok=True)
-        if memory == "current" and base.memory_dir.exists():
-            for p in base.memory_dir.glob("*.md"):
-                shutil.copy2(p, ws / "memory" / p.name)
-        cfg = variant_config(base, variants[name], ws)
-        runner = VariantRunner(name, cfg, client_system=client_system, think=think, extract=extract,
-                               primary_transport=primary_transport, memory_transport=memory_transport)
-        try:
-            progress(f"[{name}] warming up models…")
-            await runner._drain()          # startup vector sync for the copied memory
+    def memory_for(when_iso: str | None, scripted: bool) -> tuple[dict[str, str], object, bool]:
+        """(texts, cutoff datetime or None, approximate)."""
+        if memory == "empty" or (memory == "asof" and scripted):
+            from datetime import datetime, timezone
+            return empty_texts, datetime(1970, 1, 1, tzinfo=timezone.utc), False
+        if memory == "current":
+            return current_texts, None, False
+        when = parse_ts(when_iso)
+        if when is None:
+            return empty_texts, None, True
+        texts, approx = memory_as_of(base.memory_dir, when, history_dir=base.history_dir,
+                                     versions_to_keep=base.memory.history_versions_per_file)
+        return texts, when, approx
+
+    runners: dict[str, VariantRunner] = {}
+    try:
+        for name in variant_names:
+            ws = run_dir / name
+            (ws / "memory").mkdir(parents=True, exist_ok=True)
+            cfg = variant_config(base, variants[name], ws)
+            runners[name] = VariantRunner(name, cfg, client_system=client_system, think=think, extract=extract,
+                                          primary_transport=primary_transport, memory_transport=memory_transport)
+        for name, runner in runners.items():
+            progress(f"[{name}] preparing (warm-up{', history index' if runner.orch.indexer else ''})…")
+            await runner._drain()
+            if runner.orch.indexer is not None and runner.cfg.history_recall.enabled:
+                # Real past conversations, with their original timestamps; recall is then
+                # limited per case to what existed before that case.
+                runner.orch.indexer.backfill_history_from_logs(base.conversations_dir)
+                runner.orch.queue_embed()
+                await runner._drain()
             try:
                 await runner.orch.primary.chat([{"role": "user", "content": "hi"}], options={"num_predict": 1})
-                await runner.orch.memory_client.chat([{"role": "user", "content": "hi"}],
-                                                     options={"num_predict": 1})
+                await runner.orch.memory_client.chat([{"role": "user", "content": "hi"}], options={"num_predict": 1})
             except Exception as e:
                 progress(f"[{name}] warm-up failed: {e}")
-            for s in sessions:
+
+        def shuffled() -> list[str]:
+            names = list(variant_names)
+            rng.shuffle(names)
+            return names
+
+        for s in sessions:
+            when = s.turns[0].timestamp if s.turns else None
+            texts, cutoff, approx = memory_for(when, s.source == "scripted")
+            order = shuffled()
+            order_log.append({"session": s.id, "order": order})
+            for name in order:
                 progress(f"[{name}] replaying {s.id} ({len(s.turns)} turns)")
-                turn_results += await runner.replay(s, model, max_turns)
-            for case in golden:
-                if case.session:
-                    if recorded is None:
-                        recorded = load_recorded_sessions(base.conversations_dir)
-                    if case.session not in recorded:
-                        golden_results.append(GoldenResult(name, case.name, False, ["session not found"],
-                                                           "", None, 0.0, f"no recorded session {case.session}"))
-                        continue
-                    sess = recorded[case.session]
-                else:
-                    sess = scripted_session(case)
-                # Each golden case gets a clean conversation id per variant run.
-                sess = EvalSession(f"{sess.id}#{case.name}", sess.turns, sess.source)
+                await runners[name].set_point_in_time(texts, cutoff, {s.id})
+                turn_results += await runners[name].replay(s, model, max_turns)
+
+        recorded = None
+        for case in golden:
+            if case.session:
+                if recorded is None:
+                    recorded = load_recorded_sessions(base.conversations_dir)
+                if case.session not in recorded:
+                    for name in variant_names:
+                        golden_results.append(GoldenResult(name, case.name, False, ["session not found"], "", None,
+                                                           0.0, f"no recorded session {case.session}"))
+                    continue
+                src = recorded[case.session]
+                upto = case.upto_turn if case.upto_turn is not None else len(src.turns)
+                # The moment the question was (or would have been) asked.
+                ask_turn = src.turns[upto] if upto < len(src.turns) else (src.turns[-1] if src.turns else None)
+                when = ask_turn.timestamp if ask_turn else None
+                texts, cutoff, approx = memory_for(when, False)
+            elif case.as_of:
+                # A fresh conversation at a past moment: only memory and history recall can answer.
+                src = EvalSession(f"asof:{case.name}", [], "asof")
+                when = case.as_of
+                texts, cutoff, approx = memory_for(when, False)
+            else:
+                src = scripted_session(case)
+                when = None
+                texts, cutoff, approx = memory_for(None, True)
+            sess = EvalSession(f"{src.id}#{case.name}", src.turns, src.source)
+            order = shuffled()
+            order_log.append({"case": case.name, "order": order})
+            for name in order:
                 progress(f"[{name}] golden: {case.name}")
-                golden_results.extend(await runner.golden(case, sess, model, max_answer_tokens, seed, repeats))
-        finally:
+                await runners[name].set_point_in_time(texts, cutoff, {case.session} if case.session else set())
+                for g in await runners[name].golden(case, sess, model, max_answer_tokens, seed, repeats):
+                    g.memory_as_of = when if memory == "asof" else memory
+                    g.approximate_memory = approx
+                    golden_results.append(g)
+    finally:
+        for runner in runners.values():
             await runner.aclose()
 
     report = summarize(variant_names, turn_results, golden_results)
+    report["paired"] = paired(variant_names, turn_results, golden_results)
+    from .eval_diagnose import summarize_diagnoses
+    report["diagnosis"] = summarize_diagnoses([asdict(g) for g in golden_results], variant_names)
+    report["approximate_memory_cases"] = sorted({g.case for g in golden_results if g.approximate_memory})
     report.update(started=run_dir.name, model=model, memory_model=base.ollama.memory.model,
                   options={"max_turns": max_turns, "memory": memory, "extract": extract, "think": think,
-                           "repeats": repeats,
+                           "repeats": repeats, "seed": seed,
                            "sessions": [s.id for s in sessions], "golden_cases": [c.name for c in golden]},
+                  order=order_log,
                   turns=[asdict(r) for r in turn_results], golden=[asdict(g) for g in golden_results])
     out_dir.joinpath("reports").mkdir(parents=True, exist_ok=True)
     report["regressions"] = compare_with_previous(report, out_dir / "reports")
@@ -477,6 +602,44 @@ def summarize(variant_names: list[str], turns: list[TurnResult], golden: list[Go
         if b and v != base and b["prefill_s"]:
             r["prefill_vs_" + base] = round(r["prefill_s"] / b["prefill_s"] - 1, 3)
     return {"baseline": base, "variants": rows}
+
+
+def mcnemar_exact(b: int, c: int) -> float:
+    """Two-sided exact McNemar p-value: b = only A passed, c = only B passed."""
+    from math import comb
+    n = b + c
+    if n == 0:
+        return 1.0
+    k = min(b, c)
+    return min(1.0, 2 * sum(comb(n, i) for i in range(k + 1)) / 2 ** n)
+
+
+def paired(variant_names: list[str], turns: list[TurnResult], golden: list[GoldenResult]) -> dict:
+    """Paired comparisons of every variant against the first, on identical items."""
+    from statistics import median
+    if not variant_names:
+        return {}
+    base = variant_names[0]
+    out = {}
+    g_by = {(g.variant, g.case, g.repeat): g for g in golden if not g.error}
+    t_by = {(t.variant, t.session, t.turn): t for t in turns if not t.error and t.processed_tokens}
+    for v in variant_names[1:]:
+        keys = [(k[1], k[2]) for k in g_by if k[0] == base and (v, k[1], k[2]) in g_by]
+        only_base = sum(1 for c, r in keys if g_by[(base, c, r)].passed and not g_by[(v, c, r)].passed)
+        only_v = sum(1 for c, r in keys if g_by[(v, c, r)].passed and not g_by[(base, c, r)].passed)
+        both = sum(1 for c, r in keys if g_by[(v, c, r)].passed and g_by[(base, c, r)].passed)
+        tk = [(s, n) for (vv, s, n) in t_by if vv == base and (v, s, n) in t_by]
+        ratios = [t_by[(v, s, n)].processed_tokens / t_by[(base, s, n)].processed_tokens for s, n in tk]
+        out[v] = {
+            "vs": base,
+            "golden_pairs": len(keys), "both_pass": both,
+            "only_this_passes": only_v, "only_baseline_passes": only_base,
+            "mcnemar_p": round(mcnemar_exact(only_base, only_v), 4) if keys else None,
+            "turn_pairs": len(tk),
+            "median_token_ratio": round(median(ratios), 3) if ratios else None,
+            "turns_cheaper": sum(1 for r in ratios if r < 1),
+        }
+    return out
 
 
 def wilson(passed: int, total: int, z: float = 1.96) -> list[float] | None:
@@ -571,6 +734,48 @@ def render_markdown(report: dict) -> str:
             ci_txt = "" if not ci else f"{ci[0]:.0%}–{ci[1]:.0%}"
             lines.append(f"| {v} | {r['golden_passed']}/{r['golden_total']} | {ci_txt} |")
         lines += ["", "Overlapping intervals mean the difference may be noise: add cases or use --repeats."]
+    dg = report.get("diagnosis") or {}
+    if any(sum(x["counts"].values()) for x in dg.values()):
+        from .eval_diagnose import CATEGORIES, LABELS
+        used = [c for c in CATEGORIES if any(x["counts"].get(c) for x in dg.values())]
+        lines += ["", "## Why answers passed or failed", "",
+                  "Where the expected answer was when the question was asked.", "",
+                  "| variant | " + " | ".join(LABELS[c] for c in used) + " | memory reached the prompt |",
+                  "|---|" + "---|" * (len(used) + 1)]
+        for v, x in dg.items():
+            mr = x["memory_retrieval"]
+            rate = "–" if mr["rate"] is None else f"{mr['reached_prompt']}/{mr['available']}"
+            lines.append(f"| {v} | " + " | ".join(str(x["counts"].get(c, 0)) for c in used) + f" | {rate} |")
+        lines += ["", "*Model missed it*: the answer was in the prompt. *Not retrieved*: it was in memory or past "
+                  "conversations but didn't reach the prompt. *Lost from the session*: said earlier in the "
+                  "session, then trimmed or compressed away. *Never available*: nothing the system had contained "
+                  "it. *Answered without evidence*: passed without the answer in the prompt (known or guessed)."]
+    pr = report.get("paired") or {}
+    if pr:
+        lines += ["", f"## Paired comparison against {report['baseline']}", "",
+                  "Same questions and the same turns for both variants, so only the differences count.", "",
+                  "| variant | questions both pass | only this passes | only baseline passes | p (McNemar) | "
+                  "median processed tokens vs baseline | turns cheaper |", "|---|---|---|---|---|---|---|"]
+        for v, x in pr.items():
+            p = x["mcnemar_p"]
+            p_txt = "–" if p is None else (f"{p:.3f}" + (" significant" if p < 0.05 else ""))
+            ratio = "–" if x["median_token_ratio"] is None else f"{(x['median_token_ratio'] - 1) * 100:+.0f}%"
+            lines.append(f"| {v} | {x['both_pass']}/{x['golden_pairs']} | {x['only_this_passes']} | "
+                         f"{x['only_baseline_passes']} | {p_txt} | {ratio} | {x['turns_cheaper']}/{x['turn_pairs']} |")
+        lines += ["", "p < 0.05 means the accuracy difference is unlikely to be chance. Repeats of one question "
+                  "are not fully independent, so treat p-values from --repeats as optimistic."]
+    opts = report.get("options") or {}
+    mem_note = {"asof": "each session and question started from memory as it was at that moment (no future "
+                        "knowledge); scripted questions started empty",
+                "current": "every session and question used today's memory, which may contain answers "
+                           "learned later (flatters memory variants)",
+                "empty": "every session and question started from empty memory"}.get(opts.get("memory"))
+    if mem_note:
+        lines += ["", f"Memory: {mem_note}. Variant order was shuffled per session and question (seed "
+                  f"{opts.get('seed')})."]
+    if report.get("approximate_memory_cases"):
+        lines += [f"Approximate point-in-time memory (older snapshots already pruned): "
+                  f"{', '.join(report['approximate_memory_cases'])}."]
     reg = report.get("regressions") or {}
     if reg.get("previous"):
         lines += ["", f"## Compared with {reg['previous']}", ""]
@@ -603,9 +808,13 @@ def accept_candidate(db, candidate_id: int, golden_path: Path, *, expect: list[s
     forbid = list(forbid or []) or list(cand.get("suggested_forbid") or [])
     if not expect and not forbid:
         raise ValueError("nothing to check: no expectation was suggested; pass --expect (and/or --forbid)")
-    name = name or f"correction-{candidate_id}"
-    case = {"name": name, "session": cand["conversation_id"], "upto_turn": max(0, cand["turn"] - 2),
-            "question": cand["question"]}
+    generated = cand.get("kind") == "generated"
+    name = name or (f"generated-{candidate_id}" if generated else f"correction-{candidate_id}")
+    upto = cand["upto_turn"] if generated and cand.get("upto_turn") is not None else max(0, cand["turn"] - 2)
+    if generated and cand.get("as_of"):
+        case = {"name": name, "as_of": cand["as_of"], "question": cand["question"]}
+    else:
+        case = {"name": name, "session": cand["conversation_id"], "upto_turn": upto, "question": cand["question"]}
     if expect:
         case["expect_all"] = expect
     if forbid:
@@ -621,7 +830,9 @@ def accept_candidate(db, candidate_id: int, golden_path: Path, *, expect: list[s
             raise ValueError(f"a case named {name!r} already exists in {golden_path}")
     block = yaml.safe_dump([case], allow_unicode=True, sort_keys=False, width=100)
     block = "".join("  " + line if line.strip() else line for line in block.splitlines(True))
-    comment = f"  # from correction #{candidate_id}: {cand['correction'][:80]!r}\n".replace("\n", " ").rstrip() + "\n"
+    origin = (f"generated #{candidate_id} from: {cand.get('context', '')[:80]!r}" if generated
+              else f"from correction #{candidate_id}: {cand['correction'][:80]!r}")
+    comment = f"  # {origin}\n".replace("\n", " ").rstrip() + "\n"
     if original is None or not (yaml.safe_load(original) or {}).get("cases"):
         text = "cases:\n" + comment + block
     else:

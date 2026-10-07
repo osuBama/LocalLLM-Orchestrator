@@ -25,8 +25,9 @@ client ──► orchestrator :8000 ──► Ollama A (GPU 1)  primary model
 - **Self-maintaining**: idle-time consolidation of duplicates, with backups and one-command restore.
 - **Web console**: status of both GPUs, chat, memory browser and editor, settings, and side-by-side eval
   comparison at `http://127.0.0.1:8000/ui`.
-- **Evaluation harness**: replays your own sessions to compare settings on cost and accuracy, and turns
-  your corrections into test cases.
+- **Evaluation harness**: replays your own sessions to compare settings on cost and accuracy, explains why
+  each answer passed or failed, and builds its test set from your corrections and from facts in your
+  recorded sessions.
 
 ## Requirements
 
