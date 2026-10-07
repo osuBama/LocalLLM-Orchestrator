@@ -46,7 +46,7 @@ class ScoredEntry:
 class MemoryRetriever(ABC):
     @abstractmethod
     def search(self, query: str, limit: int, categories: list[Category] | None = None,
-               include_inactive: bool = False) -> list[ScoredEntry]:
+               include_inactive: bool = False, query_vec=None) -> list[ScoredEntry]:
         ...
 
 
@@ -61,7 +61,7 @@ class KeywordRetriever(MemoryRetriever):
         return out
 
     def search(self, query: str, limit: int, categories: list[Category] | None = None,
-               include_inactive: bool = False) -> list[ScoredEntry]:
+               include_inactive: bool = False, query_vec=None) -> list[ScoredEntry]:
         entries = self._corpus(categories, include_inactive)
         q_terms = set(tokenize(query))
         if not q_terms or not entries:
@@ -89,3 +89,37 @@ class KeywordRetriever(MemoryRetriever):
                 scored.append(ScoredEntry(e, round(score, 4)))
         scored.sort(key=lambda s: s.score, reverse=True)
         return scored[:limit]
+
+
+class HybridRetriever(KeywordRetriever):
+    """Keyword + vector search merged with reciprocal rank fusion (RRF).
+
+    Keywords are strong on what memory is full of (ports, error codes, model names,
+    paths); vectors catch paraphrases and other languages. An entry found only by the
+    vector side must clear `min_similarity`, so semantic near-misses can't pad the prompt.
+    Without a query vector this is exactly the keyword retriever.
+    """
+    RRF_K = 60
+
+    def __init__(self, stores: dict[Category, MarkdownStore], index, min_similarity: float = 0.35):
+        super().__init__(stores)
+        self.index = index
+        self.min_similarity = min_similarity
+
+    def search(self, query: str, limit: int, categories: list[Category] | None = None,
+               include_inactive: bool = False, query_vec=None) -> list[ScoredEntry]:
+        kw = super().search(query, limit * 3, categories, include_inactive)
+        if query_vec is None or self.index is None:
+            return kw[:limit]
+        entries = {e.entry_id: e for e in self._corpus(categories, include_inactive)}
+        vec = [(k, s) for k, s in self.index.search("memory", query_vec, limit * 3, allowed=set(entries))]
+        kw_ids = {s.entry.entry_id for s in kw}
+        fused: dict[str, float] = {}
+        for rank, s in enumerate(kw):
+            fused[s.entry.entry_id] = fused.get(s.entry.entry_id, 0) + 1 / (self.RRF_K + rank + 1)
+        for rank, (k, sim) in enumerate(vec):
+            if k not in kw_ids and sim < self.min_similarity:
+                continue
+            fused[k] = fused.get(k, 0) + 1 / (self.RRF_K + rank + 1)
+        ranked = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)[:limit]
+        return [ScoredEntry(entries[k], round(score * 1000, 3)) for k, score in ranked if k in entries]

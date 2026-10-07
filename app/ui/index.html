@@ -1,0 +1,614 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local AI console</title>
+<style>
+:root {
+  --paper: #EEF1F4;
+  --sheet: #FFFFFF;
+  --ink: #1C2430;
+  --ink-soft: #5A6675;
+  --line: #D5DBE2;
+  --primary: #2B59C3;
+  --primary-tint: #E3EAF8;
+  --memory: #0F7B78;
+  --memory-tint: #DDF0EF;
+  --warn: #B7791F;
+  --warn-tint: #FBF1DE;
+  --bad: #B3261E;
+  --bad-tint: #F9E1DF;
+  --num: "Bahnschrift", "DIN Alternate", "Roboto Condensed", "Segoe UI Variable Display", system-ui, sans-serif;
+  --text: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", sans-serif;
+  --code: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--paper); color: var(--ink); font: 15px/1.55 var(--text); }
+button, input, select, textarea { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+
+/* ---------- the two lanes: the console's signature ---------- */
+header.lanes { display: grid; grid-template-columns: auto 1fr 1fr; gap: 0; background: var(--sheet); border-bottom: 1px solid var(--line); }
+.brand { padding: 18px 22px; font: 600 17px/1.2 var(--num); letter-spacing: .01em; display: flex; flex-direction: column; justify-content: center; gap: 4px; border-right: 1px solid var(--line); min-width: 150px; }
+.brand small { font: 400 12px var(--text); color: var(--ink-soft); }
+.lane { padding: 14px 22px 14px 26px; position: relative; display: grid; grid-template-columns: 1fr auto; gap: 2px 18px; align-items: baseline; }
+.lane::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 6px; }
+.lane.a::before { background: var(--primary); }
+.lane.b::before { background: var(--memory); }
+.lane.b { border-left: 1px solid var(--line); }
+.lane .role { font-size: 13px; color: var(--ink-soft); }
+.lane .model { font: 600 22px/1.2 var(--num); grid-column: 1; overflow-wrap: anywhere; }
+.lane .side { grid-column: 2; grid-row: 1 / span 2; text-align: right; font-size: 13px; color: var(--ink-soft); }
+.lane .side b { display: block; font: 600 20px var(--num); color: var(--ink); }
+.residency { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.res-row { display: grid; grid-template-columns: minmax(90px, 180px) 1fr 52px; gap: 10px; align-items: center; font-size: 13px; }
+.res-row .bar { height: 8px; background: var(--paper); border-radius: 4px; overflow: hidden; }
+.res-row .bar i { display: block; height: 100%; }
+.lane.a .bar i { background: var(--primary); }
+.lane.b .bar i { background: var(--memory); }
+.res-row .bar i.partial { background: var(--warn); }
+.res-row span:last-child { font-family: var(--num); text-align: right; }
+.down { color: var(--bad); font-weight: 600; }
+
+nav.tabs { display: flex; gap: 4px; padding: 0 22px; background: var(--sheet); border-bottom: 1px solid var(--line); overflow-x: auto; }
+nav.tabs button { background: none; border: 0; padding: 12px 14px 10px; border-bottom: 3px solid transparent; cursor: pointer; color: var(--ink-soft); white-space: nowrap; }
+nav.tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--ink); font-weight: 600; }
+.warnings { margin: 0; padding: 0; list-style: none; }
+.warnings li { background: var(--warn-tint); border-left: 4px solid var(--warn); padding: 8px 14px; margin: 0 22px; font-size: 14px; }
+.warnings li + li { margin-top: 2px; }
+.warnings:not(:empty) { padding: 12px 0 0; }
+
+main { padding: 22px; max-width: 1280px; }
+section.view { display: none; }
+section.view.on { display: block; }
+h2 { font: 600 19px/1.3 var(--num); margin: 26px 0 10px; }
+h2:first-child { margin-top: 0; }
+h3 { font: 600 15px var(--text); margin: 18px 0 8px; }
+p.hint { color: var(--ink-soft); margin: 4px 0 12px; max-width: 75ch; font-size: 14px; }
+.panel { background: var(--sheet); border: 1px solid var(--line); border-radius: 4px; padding: 16px 18px; margin-bottom: 16px; }
+.panel.a { border-left: 4px solid var(--primary); }
+.panel.b { border-left: 4px solid var(--memory); }
+.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.num { font-family: var(--num); font-variant-numeric: tabular-nums; }
+dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 18px; margin: 0; font-size: 14px; }
+dl.facts dt { color: var(--ink-soft); }
+dl.facts dd { margin: 0; font-family: var(--num); }
+
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 600; color: var(--ink-soft); font-size: 13px; }
+td.n, th.n { text-align: right; font-family: var(--num); font-variant-numeric: tabular-nums; }
+.scroll { overflow-x: auto; }
+
+.btn { border: 1px solid var(--ink); background: var(--sheet); padding: 6px 14px; border-radius: 4px; cursor: pointer; }
+.btn.go { background: var(--ink); color: #fff; }
+.btn.quiet { border-color: var(--line); }
+.btn.danger { border-color: var(--bad); color: var(--bad); }
+.btn:disabled { opacity: .5; cursor: default; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+input[type=text], input[type=number], select, textarea { border: 1px solid var(--line); background: #fff; border-radius: 4px; padding: 6px 9px; }
+textarea { width: 100%; resize: vertical; }
+label.inline { display: inline-flex; gap: 6px; align-items: center; font-size: 14px; }
+.pill { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 10px; background: var(--paper); color: var(--ink-soft); }
+.pill.live { background: var(--memory-tint); color: var(--memory); }
+.pill.restart { background: var(--warn-tint); color: var(--warn); }
+.pill.off { background: var(--bad-tint); color: var(--bad); }
+code, pre { font-family: var(--code); font-size: 13px; }
+pre { background: var(--paper); padding: 10px 12px; border-radius: 4px; overflow: auto; white-space: pre-wrap; margin: 6px 0; }
+
+/* chat */
+.chat { display: grid; grid-template-rows: 1fr auto; height: calc(100vh - 290px); min-height: 420px; background: var(--sheet); border: 1px solid var(--line); border-radius: 4px; }
+.log { overflow-y: auto; padding: 18px 22px; }
+.msg { max-width: 78ch; margin-bottom: 18px; }
+.msg.you { margin-left: auto; background: var(--primary-tint); padding: 10px 14px; border-radius: 4px; }
+.msg.ai p { margin: 0 0 8px; }
+.msg .meta { font-size: 12px; color: var(--ink-soft); margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px 12px; }
+.composer { border-top: 1px solid var(--line); padding: 12px; display: grid; grid-template-columns: 1fr auto; gap: 10px; }
+.composer textarea { min-height: 52px; max-height: 200px; }
+.empty { color: var(--ink-soft); padding: 30px 0; max-width: 60ch; }
+
+/* memory */
+.mem-entry { border-bottom: 1px solid var(--line); padding: 10px 0; display: grid; grid-template-columns: 70px 1fr auto; gap: 4px 14px; }
+.mem-entry .id { font-family: var(--num); color: var(--ink-soft); }
+.mem-entry .t { font-weight: 600; }
+.mem-entry.inactive { opacity: .55; }
+.mem-entry .used { font-size: 12px; color: var(--ink-soft); text-align: right; white-space: nowrap; }
+.mem-entry .edit { grid-column: 2 / -1; display: grid; gap: 6px; }
+.cat-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+.cat-tabs button { border: 1px solid var(--line); background: var(--sheet); border-radius: 14px; padding: 3px 12px; cursor: pointer; font-size: 14px; }
+.cat-tabs button[aria-pressed="true"] { border-color: var(--memory); background: var(--memory-tint); color: var(--memory); }
+
+/* settings */
+.setting { display: grid; grid-template-columns: minmax(200px, 300px) minmax(140px, 220px) 1fr; gap: 6px 18px; padding: 10px 0; border-bottom: 1px solid var(--line); align-items: start; }
+.setting .help { font-size: 13px; color: var(--ink-soft); }
+.setting code { font-size: 12px; color: var(--ink-soft); display: block; }
+.setting.dirty { background: linear-gradient(90deg, var(--primary-tint), transparent 60%); }
+.savebar { position: sticky; bottom: 0; background: var(--sheet); border-top: 1px solid var(--line); padding: 12px 0; margin-top: 10px; }
+
+/* evals */
+.hbar { display: grid; grid-template-columns: minmax(160px, 260px) 1fr 90px; gap: 10px; align-items: center; font-size: 13px; margin: 3px 0; }
+.hbar .track { height: 14px; background: var(--paper); border-radius: 2px; position: relative; }
+.hbar .fill { position: absolute; left: 0; top: 0; bottom: 0; background: var(--primary); border-radius: 2px; }
+.hbar .fill.m { background: var(--memory); }
+.hbar .ci { position: absolute; top: -3px; bottom: -3px; border-left: 2px solid var(--ink); border-right: 2px solid var(--ink); }
+.hbar span:last-child { font-family: var(--num); text-align: right; }
+.flag { color: var(--bad); }
+td.pass { color: var(--memory); }
+td.fail { color: var(--bad); }
+
+.toast { position: fixed; right: 18px; bottom: 18px; max-width: 420px; background: var(--ink); color: #fff; padding: 10px 14px; border-radius: 4px; font-size: 14px; display: none; }
+.toast.show { display: block; }
+.toast.err { background: var(--bad); }
+
+@media (max-width: 900px) {
+  header.lanes { grid-template-columns: 1fr; }
+  .brand { border-right: 0; border-bottom: 1px solid var(--line); }
+  .lane.b { border-left: 0; border-top: 1px solid var(--line); }
+  .cols { grid-template-columns: 1fr; }
+  .setting { grid-template-columns: 1fr; }
+  .mem-entry { grid-template-columns: 56px 1fr; }
+  .mem-entry .used { grid-column: 2; text-align: left; }
+}
+</style>
+</head>
+<body>
+<header class="lanes" aria-label="System status">
+  <div class="brand">Local AI<small id="brand-sub">console</small></div>
+  <div class="lane a" id="lane-a"><span class="role">Primary GPU</span><span class="model">connecting</span></div>
+  <div class="lane b" id="lane-b"><span class="role">Memory GPU</span><span class="model">connecting</span></div>
+</header>
+<ul class="warnings" id="warnings" aria-live="polite"></ul>
+<nav class="tabs" role="tablist">
+  <button role="tab" data-view="overview" aria-selected="true">Overview</button>
+  <button role="tab" data-view="chat" aria-selected="false">Chat</button>
+  <button role="tab" data-view="memory" aria-selected="false">Memory</button>
+  <button role="tab" data-view="settings" aria-selected="false">Settings</button>
+  <button role="tab" data-view="evals" aria-selected="false">Evals</button>
+</nav>
+
+<main>
+<!-- ====================================================== overview -->
+<section class="view on" id="view-overview">
+  <div class="cols">
+    <div class="panel a"><h3>Requests to the primary</h3><dl class="facts" id="ov-requests"></dl></div>
+    <div class="panel b"><h3>Background work on the memory GPU</h3><dl class="facts" id="ov-memory"></dl></div>
+  </div>
+  <h2>Recent requests</h2>
+  <p class="hint">Processed tokens are what Ollama actually had to read; cache hits make this smaller.</p>
+  <div class="panel scroll"><table id="ov-recent"><thead><tr>
+    <th>Source</th><th class="n">Processed tokens</th><th class="n">Memory tokens</th><th class="n">Cached base</th>
+    <th>Thinking</th><th class="n">First token (s)</th><th class="n">Total (s)</th><th class="n">Turns cut</th><th class="n">Tool tokens saved</th>
+  </tr></thead><tbody></tbody></table></div>
+</section>
+
+<!-- ========================================================== chat -->
+<section class="view" id="view-chat">
+  <div class="row" style="justify-content: space-between; margin-bottom: 10px">
+    <p class="hint" style="margin:0">Chat through the orchestrator, with memory. OpenClaw and other clients keep working alongside.</p>
+    <div class="row"><span class="pill" id="chat-cid">new conversation</span><button class="btn quiet" id="chat-new">New conversation</button></div>
+  </div>
+  <div class="chat">
+    <div class="log" id="chat-log" aria-live="polite">
+      <p class="empty">Ask anything. Below each answer you'll see which memory entries were used and whether the model thought before answering.</p>
+    </div>
+    <form class="composer" id="chat-form">
+      <textarea id="chat-input" placeholder="Message (Enter to send, Shift+Enter for a new line)" aria-label="Message"></textarea>
+      <button class="btn go" type="submit" id="chat-send">Send</button>
+    </form>
+  </div>
+</section>
+
+<!-- ======================================================== memory -->
+<section class="view" id="view-memory">
+  <div class="row" style="margin-bottom: 14px">
+    <input type="text" id="mem-search" placeholder="Search memory" style="flex: 1; min-width: 220px" aria-label="Search memory">
+    <label class="inline"><input type="checkbox" id="mem-inactive"> Show inactive</label>
+    <button class="btn quiet" id="mem-add-toggle">Add entry</button>
+  </div>
+  <div class="cat-tabs" id="mem-cats"></div>
+  <div class="panel b" id="mem-add" hidden>
+    <div class="row"><select id="mem-add-cat" aria-label="Category"></select>
+      <input type="text" id="mem-add-title" placeholder="Short title" style="flex:1" aria-label="Title"></div>
+    <textarea id="mem-add-content" rows="3" placeholder="One to three plain sentences" style="margin-top:8px" aria-label="Content"></textarea>
+    <div class="row" style="margin-top:8px"><button class="btn go" id="mem-add-save">Add entry</button></div>
+  </div>
+  <div class="panel" id="mem-list"></div>
+
+  <h2>What a prompt would receive</h2>
+  <p class="hint">Type a prompt to see the cached memory base and the per-turn block it would get.</p>
+  <div class="row"><input type="text" id="ctx-q" placeholder="e.g. why does the MCP server return 404?" style="flex:1" aria-label="Prompt to preview">
+    <button class="btn" id="ctx-go">Preview</button></div>
+  <div id="ctx-out"></div>
+
+  <h2>Maintenance</h2>
+  <div class="row">
+    <button class="btn" id="m-backup">Back up now</button>
+    <button class="btn" id="m-consol-dry">Preview consolidation</button>
+    <button class="btn" id="m-consol">Consolidate now</button>
+    <button class="btn" id="m-review">Show unused entries</button>
+    <button class="btn" id="m-reindex">Reindex for search</button>
+    <button class="btn quiet" id="m-changes">Recent changes</button>
+  </div>
+  <div id="m-out" style="margin-top: 12px"></div>
+</section>
+
+<!-- ====================================================== settings -->
+<section class="view" id="view-settings">
+  <p class="hint" id="set-hint">Changes are written to config.yaml with a backup; your comments are kept. Settings marked
+    “applies now” take effect immediately; the others after restarting the orchestrator.</p>
+  <div id="set-form"></div>
+  <div class="savebar row"><button class="btn go" id="set-save" disabled>Save changes</button>
+    <button class="btn quiet" id="set-reset" disabled>Discard</button><span id="set-status" class="hint" style="margin:0"></span></div>
+</section>
+
+<!-- ========================================================= evals -->
+<section class="view" id="view-evals">
+  <h2>Run an evaluation</h2>
+  <p class="hint">Replays recorded sessions and golden questions under different settings, in isolated copies.
+    Live traffic while it runs makes timing numbers noisier.</p>
+  <div class="panel">
+    <div class="row">
+      <label class="inline">Variants <input type="text" id="ev-variants" value="baseline,full" size="28"></label>
+      <label class="inline">Last sessions <input type="number" id="ev-last" value="3" min="0" max="50" style="width:70px"></label>
+      <label class="inline">Repeats <input type="number" id="ev-repeats" value="1" min="1" max="20" style="width:70px"></label>
+      <label class="inline">Thinking <select id="ev-think"><option value="off">off</option><option value="default">let the orchestrator decide</option><option value="on">on</option></select></label>
+      <label class="inline"><input type="checkbox" id="ev-golden"> Golden questions only</label>
+      <button class="btn go" id="ev-run">Start evaluation</button>
+    </div>
+    <pre id="ev-log" hidden></pre>
+  </div>
+
+  <h2>Compare reports</h2>
+  <p class="hint">Select two or more reports. Bars show processed prompt tokens (cost) and golden pass rate with its 95% interval (accuracy).</p>
+  <div class="panel scroll"><table id="ev-reports"><thead><tr><th></th><th>Report</th><th>Variants</th><th class="n">Sessions</th><th class="n">Golden</th><th class="n">Repeats</th><th>Flags</th></tr></thead><tbody></tbody></table>
+    <div class="row" style="margin-top:10px"><button class="btn" id="ev-compare" disabled>Compare selected</button></div></div>
+  <div id="ev-cmp"></div>
+
+  <h2>Corrections waiting for review</h2>
+  <p class="hint">When you correct the model, the question can become a golden test. Accept to add it to evals/golden.yaml.</p>
+  <div id="ev-cands"></div>
+</section>
+</main>
+<div class="toast" id="toast" role="status"></div>
+
+<script>
+"use strict";
+const $ = (s, el = document) => el.querySelector(s);
+const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const fmt = (n, d = 0) => n == null || n === "" ? "–" : Number(n).toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d });
+const pct = x => x == null ? "–" : Math.round(x * 100) + "%";
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: { "Content-Type": "application/json", "X-AI-Client": "console", ...(opts.headers || {}) } });
+  const text = await r.text();
+  let data; try { data = text ? JSON.parse(text) : {}; } catch { data = { detail: text }; }
+  if (!r.ok) throw new Error(data.detail || data.error || `HTTP ${r.status}`);
+  return data;
+}
+const post = (path, body) => api(path, { method: "POST", body: JSON.stringify(body ?? {}) });
+
+let toastTimer;
+function toast(msg, err = false) {
+  const t = $("#toast"); t.textContent = msg; t.className = "toast show" + (err ? " err" : "");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.className = "toast", err ? 7000 : 3500);
+}
+async function busy(btn, fn) {
+  btn.disabled = true;
+  try { await fn(); } catch (e) { toast(e.message, true); } finally { btn.disabled = false; }
+}
+
+/* ---------------------------------------------------------- tabs */
+$$("nav.tabs button").forEach(b => b.addEventListener("click", () => show(b.dataset.view)));
+function show(view) {
+  $$("nav.tabs button").forEach(b => b.setAttribute("aria-selected", b.dataset.view === view));
+  $$("section.view").forEach(s => s.classList.toggle("on", s.id === "view-" + view));
+  location.hash = view;
+  ({ memory: loadMemory, settings: loadSettings, evals: loadEvals }[view] || (() => {}))();
+}
+
+/* -------------------------------------------- header lanes + overview */
+function residency(models) {
+  if (!models || !models.length) return `<div class="residency"><div class="res-row"><span>no model loaded yet</span><span></span><span></span></div></div>`;
+  return `<div class="residency">${models.map(m => {
+    const p = m.gpu_percent ?? 0;
+    return `<div class="res-row"><span title="${esc(m.name)}">${esc(m.name)}</span><span class="bar" role="img" aria-label="${p}% on GPU"><i class="${p < 100 ? "partial" : ""}" style="width:${Math.min(100, p)}%"></i></span><span>${p}%</span></div>`;
+  }).join("")}</div>`;
+}
+function lane(el, label, h, extra) {
+  const up = h && h.reachable;
+  el.innerHTML = `<span class="role">${label}${h ? ` on port ${esc((h.base_url || "").split(":").pop())}` : ""}</span>
+    <span class="model">${esc(h ? h.model : "–")}</span>
+    <span class="side">${up ? extra : `<span class="down">not reachable</span>`}</span>
+    ${up ? residency(h.loaded_models) : `<div class="residency"><div class="res-row"><span class="down">${esc(h?.error || "")}</span></div></div>`}`;
+}
+async function refreshStatus() {
+  try {
+    const [h, m] = await Promise.all([api("/health"), api("/metrics")]);
+    $("#brand-sub").textContent = `v${h.version}`;
+    lane($("#lane-a"), "Primary GPU", h.primary, `<b>${fmt(m.totals.requests)}</b>requests`);
+    const t = h.memory_tasks || {};
+    lane($("#lane-b"), "Memory GPU", h.memory, `<b>${fmt((t.pending || 0) + (t.processing || 0))}</b>tasks queued`);
+    $("#warnings").innerHTML = (h.warnings || []).map(w => `<li>${esc(w)}</li>`).join("");
+    const a = m.averages || {};
+    $("#ov-requests").innerHTML = [
+      ["Requests", fmt(m.totals.requests)], ["Errors", fmt(m.totals.errors)],
+      ["Avg processed tokens", fmt(a.prompt_tokens)], ["Avg memory tokens", fmt(a.memory_tokens)],
+      ["Avg first token", a.time_to_first_token == null ? "–" : fmt(a.time_to_first_token, 2) + " s"],
+      ["Avg request time", a.total_request_time == null ? "–" : fmt(a.total_request_time, 2) + " s"],
+      ["Avg generation speed", a.tokens_per_second == null ? "–" : fmt(a.tokens_per_second, 1) + " tok/s"],
+    ].map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+    const cal = Object.entries(m.token_calibration || {}).map(([mod, c]) => `${mod}: ${c.calibrated ? fmt(c.chars_per_token, 2) + " chars/token" : `learning (${c.observations}/5)`}`);
+    const dg = m.tool_digests || {};
+    $("#ov-memory").innerHTML = [
+      ["Tasks", Object.entries(t).map(([k, v]) => `${v} ${k}`).join(", ") || "none"],
+      ["Memory changes applied", fmt(m.totals.memory_changes_applied)],
+      ["Memory store size", fmt(m.memory_store_tokens) + " tokens"],
+      ["Search vectors", h.embeddings ? `${fmt(h.embeddings.memory_vectors)} memory, ${fmt(h.embeddings.history_vectors)} history` : "embeddings off"],
+      ["Tool digests", `${fmt(dg.usable)} usable of ${fmt(dg.digests)}`],
+      ["Token calibration", cal.join("; ") || "no data yet"],
+    ].map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join("");
+    $("#ov-recent tbody").innerHTML = (m.recent_requests || []).slice().reverse().map(r => `<tr>
+      <td>${esc(r.mode === "proxy" ? "client" : r.mode)}${r.error ? ` <span class="flag" title="${esc(r.error)}">error</span>` : ""}</td>
+      <td class="n">${fmt(r.prompt_tokens)}</td><td class="n">${fmt(r.memory_tokens)}</td><td class="n">${fmt(r.memory_base_tokens)}</td>
+      <td title="${esc(r.thinking_reason || "")}">${esc(r.thinking || "–")}</td>
+      <td class="n">${fmt(r.time_to_first_token, 2)}</td><td class="n">${fmt(r.total_request_time, 2)}</td>
+      <td class="n">${fmt(r.user_turns_dropped)}</td><td class="n">${fmt(r.tool_tokens_saved)}</td></tr>`).join("")
+      || `<tr><td colspan="9" class="hint">No requests yet. Send a message in Chat or from your client.</td></tr>`;
+  } catch (e) {
+    $("#warnings").innerHTML = `<li>Orchestrator not reachable: ${esc(e.message)}</li>`;
+  }
+}
+
+/* ------------------------------------------------------------ chat */
+let chatCid = localStorage.getItem("ai.chat.cid") || null;
+function setCid(c) { chatCid = c; c ? localStorage.setItem("ai.chat.cid", c) : localStorage.removeItem("ai.chat.cid"); $("#chat-cid").textContent = c ? `conversation ${c}` : "new conversation"; }
+setCid(chatCid);
+function renderText(t) {
+  const parts = String(t).split(/```(\w*)\n?([\s\S]*?)```/g);
+  let html = "";
+  for (let i = 0; i < parts.length; i++) {
+    if (i % 3 === 0) html += parts[i].split(/\n{2,}/).filter(p => p.trim()).map(p => `<p>${esc(p).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\n/g, "<br>")}</p>`).join("");
+    else if (i % 3 === 2) html += `<pre><code>${esc(parts[i])}</code></pre>`;
+  }
+  return html;
+}
+function addMsg(who, html) {
+  const log = $("#chat-log"); $(".empty", log)?.remove();
+  const d = document.createElement("div"); d.className = "msg " + who; d.innerHTML = html; log.appendChild(d);
+  log.scrollTop = log.scrollHeight; return d;
+}
+$("#chat-new").addEventListener("click", () => { setCid(null); $("#chat-log").innerHTML = `<p class="empty">New conversation.</p>`; });
+$("#chat-input").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("#chat-form").requestSubmit(); } });
+$("#chat-form").addEventListener("submit", async e => {
+  e.preventDefault();
+  const text = $("#chat-input").value.trim(); if (!text) return;
+  $("#chat-input").value = ""; addMsg("you", esc(text).replace(/\n/g, "<br>"));
+  const pending = addMsg("ai", `<p class="hint">Thinking…</p>`); $("#chat-send").disabled = true;
+  try {
+    const r = await post("/chat", { message: text, conversation_id: chatCid });
+    setCid(r.conversation_id);
+    const used = (r.memory_entries_used || []).filter(x => !String(x).startsWith("HISTORY:"));
+    const hist = (r.memory_entries_used || []).filter(x => String(x).startsWith("HISTORY:")).length;
+    pending.innerHTML = renderText(r.response) + `<div class="meta">
+      <span>Memory used: ${used.length ? esc(used.join(", ")) : "none"}</span>
+      ${hist ? `<span>${hist} past exchange${hist > 1 ? "s" : ""} recalled</span>` : ""}
+      <span title="${esc(r.thinking_reason || "")}">Thinking: ${esc(r.thinking || "–")}</span>
+      ${r.seconds != null ? `<span>${fmt(r.seconds, 1)} s</span>` : ""}
+      ${r.memory_update_queued ? "<span>Memory update queued</span>" : ""}</div>`;
+  } catch (err) { pending.innerHTML = `<p class="flag">${esc(err.message)}</p>`; }
+  finally { $("#chat-send").disabled = false; $("#chat-input").focus(); refreshStatus(); }
+});
+
+/* ---------------------------------------------------------- memory */
+const CATS = ["state", "objective", "constraint", "decision", "lesson", "discovery", "environment"];
+const CAT_LABEL = { state: "Current state", objective: "Objectives", constraint: "Constraints", decision: "Decisions", lesson: "Lessons", discovery: "Discoveries", environment: "Environment" };
+let memData = {}, memCat = "all", memHits = null;
+$("#mem-add-cat").innerHTML = CATS.map(c => `<option value="${c}">${CAT_LABEL[c]}</option>`).join("");
+async function loadMemory() {
+  try { memData = await api("/ui/api/memory"); } catch (e) { toast(e.message, true); return; }
+  renderCats(); renderMemory();
+}
+function renderCats() {
+  const counts = Object.fromEntries(CATS.map(c => [c, (memData[c]?.entries || []).filter(e => e.active).length]));
+  const all = Object.values(counts).reduce((a, b) => a + b, 0);
+  $("#mem-cats").innerHTML = [["all", `All (${all})`], ...CATS.map(c => [c, `${CAT_LABEL[c]} (${counts[c]})`])]
+    .map(([k, l]) => `<button aria-pressed="${memCat === k}" data-cat="${k}">${l}</button>`).join("");
+  $$("#mem-cats button").forEach(b => b.onclick = () => { memCat = b.dataset.cat; memHits = null; $("#mem-search").value = ""; renderCats(); renderMemory(); });
+}
+function renderMemory() {
+  const showInactive = $("#mem-inactive").checked;
+  let rows = [];
+  for (const c of CATS) if (memCat === "all" || memCat === c) for (const e of memData[c]?.entries || []) rows.push({ ...e, category: c });
+  if (memHits) { const order = new Map(memHits.map((h, i) => [h.entry_id, i])); rows = rows.filter(r => order.has(r.entry_id)).sort((a, b) => order.get(a.entry_id) - order.get(b.entry_id)); }
+  if (!showInactive) rows = rows.filter(r => r.active);
+  const errs = CATS.filter(c => memData[c]?.error).map(c => `<p class="flag">${esc(memData[c].file)}: ${esc(memData[c].error)}</p>`).join("");
+  $("#mem-list").innerHTML = errs + (rows.map(e => `
+    <div class="mem-entry ${e.active ? "" : "inactive"}" data-id="${esc(e.entry_id)}" data-cat="${e.category}">
+      <span class="id">${esc(e.entry_id)}</span>
+      <div><div class="t">${esc(e.title)}${e.active ? "" : ` <span class="pill">inactive</span>`}</div><div>${esc(e.content)}</div></div>
+      <div class="used">${e.use_count ? `used ${e.use_count}×` : "never used"}<br>
+        <button class="btn quiet" data-act="edit">Edit</button></div>
+    </div>`).join("") || `<p class="hint">${memHits ? "No matching entries." : "Nothing here yet. Entries appear as you work, or add one above."}</p>`);
+  $$("#mem-list [data-act=edit]").forEach(b => b.onclick = () => editEntry(b.closest(".mem-entry")));
+}
+function editEntry(row) {
+  const e = memData[row.dataset.cat].entries.find(x => x.entry_id === row.dataset.id);
+  if ($(".edit", row)) return;
+  const box = document.createElement("div"); box.className = "edit";
+  box.innerHTML = `<input type="text" value="${esc(e.title)}" aria-label="Title"><textarea rows="3" aria-label="Content">${esc(e.content)}</textarea>
+    <div class="row"><button class="btn go" data-a="save">Save</button>${e.active ? `<button class="btn danger" data-a="off">Deactivate</button>` : ""}<button class="btn quiet" data-a="cancel">Cancel</button></div>`;
+  row.appendChild(box);
+  $("[data-a=cancel]", box).onclick = () => box.remove();
+  $("[data-a=save]", box).onclick = ev => busy(ev.target, async () => {
+    await post("/ui/api/memory/entry", { category: row.dataset.cat, entry_id: e.entry_id, title: $("input", box).value, content: $("textarea", box).value });
+    toast(`Saved ${e.entry_id}`); loadMemory();
+  });
+  const off = $("[data-a=off]", box);
+  if (off) off.onclick = ev => busy(ev.target, async () => {
+    await post("/ui/api/memory/entry", { category: row.dataset.cat, entry_id: e.entry_id, active: false });
+    toast(`Deactivated ${e.entry_id}`); loadMemory();
+  });
+}
+$("#mem-inactive").onchange = renderMemory;
+let searchTimer;
+$("#mem-search").addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(async () => {
+    const q = $("#mem-search").value.trim();
+    if (!q) { memHits = null; return renderMemory(); }
+    try { memHits = (await api(`/memory/search?q=${encodeURIComponent(q)}&limit=30&include_inactive=true`)).results; memCat = "all"; renderCats(); renderMemory(); }
+    catch (e) { toast(e.message, true); }
+  }, 300);
+});
+$("#mem-add-toggle").onclick = () => { $("#mem-add").hidden = !$("#mem-add").hidden; if (!$("#mem-add").hidden) $("#mem-add-title").focus(); };
+$("#mem-add-save").onclick = ev => busy(ev.target, async () => {
+  const r = await post("/ui/api/memory/entry", { category: $("#mem-add-cat").value, title: $("#mem-add-title").value, content: $("#mem-add-content").value });
+  toast(`Added ${r.entry_id}`); $("#mem-add-title").value = $("#mem-add-content").value = ""; $("#mem-add").hidden = true; loadMemory();
+});
+$("#ctx-go").onclick = ev => busy(ev.target, async () => {
+  const q = $("#ctx-q").value.trim(); if (!q) return;
+  const r = await api(`/memory/context?q=${encodeURIComponent(q)}`);
+  $("#ctx-out").innerHTML = `<div class="cols" style="margin-top:12px">
+    <div class="panel b"><h3>Cached memory base, about ${fmt(r.base.token_estimate)} tokens</h3><pre>${esc(r.base.text || "(empty)")}</pre></div>
+    <div class="panel a"><h3>Per-turn block, about ${fmt(r.turn.token_estimate)} tokens</h3><pre>${esc(r.turn.text || "(nothing relevant)")}</pre>
+      ${r.turn.dropped?.length ? `<p class="hint">Left out for budget: ${esc(r.turn.dropped.join(", "))}</p>` : ""}</div></div>`;
+});
+$("#ctx-q").addEventListener("keydown", e => { if (e.key === "Enter") $("#ctx-go").click(); });
+const out = html => $("#m-out").innerHTML = html;
+$("#m-backup").onclick = ev => busy(ev.target, async () => { const r = await post("/memory/backup"); toast("Backed up"); out(`<p class="hint">Backup written to ${esc(r.backup)}</p>`); });
+function consolReport(r) {
+  return `<div class="panel b"><h3>${r.dry_run ? "Consolidation preview" : "Consolidation result"}</h3>
+    <p class="hint">${r.jobs} groups checked, ${r.applied.length} ${r.dry_run ? "changes proposed" : "changes applied"}, ${r.rejected.length} rejected${r.backup ? `, backup at ${esc(r.backup)}` : ""}${r.error ? `. Stopped: ${esc(r.error)}` : ""}.</p>
+    ${r.applied.length ? `<table><tr><th>Kind</th><th>Category</th><th>Result</th><th>Changes</th></tr>${r.applied.map(a => `<tr><td>${esc(a.kind)}</td><td>${esc(a.category)}</td><td>${esc(a.title)}</td><td>${esc(a.changes.map(c => `${c.op} ${c.id}`).join(", "))}</td></tr>`).join("")}</table>` : ""}
+    ${r.rejected.length ? `<h3>Rejected by the safety checks</h3><ul>${r.rejected.map(x => `<li>${esc(x.category || "")}: ${esc(x.reason)}</li>`).join("")}</ul>` : ""}</div>`;
+}
+$("#m-consol-dry").onclick = ev => busy(ev.target, async () => out(consolReport(await post("/memory/consolidate?dry_run=true"))));
+$("#m-consol").onclick = ev => busy(ev.target, async () => {
+  if (!confirm("Merge duplicates and tighten long entries now? A backup is taken first.")) return;
+  out(consolReport(await post("/memory/consolidate"))); loadMemory();
+});
+$("#m-review").onclick = ev => busy(ev.target, async () => {
+  const r = await api("/memory/review");
+  out(`<div class="panel"><h3>Active entries unused for ${r.stale_after_days}+ days</h3>${r.entries.length ? `<table><tr><th>Entry</th><th>Title</th><th>Last used</th><th class="n">Times used</th></tr>${r.entries.map(e => `<tr><td>${esc(e.entry_id)}</td><td>${esc(e.title)}</td><td>${esc((e.last_used_at || "never").slice(0, 10))}</td><td class="n">${e.use_count}</td></tr>`).join("")}</table><p class="hint">Nothing is removed automatically. Edit or deactivate them in the list above.</p>` : `<p class="hint">Every active entry has been used recently.</p>`}</div>`);
+});
+$("#m-reindex").onclick = ev => busy(ev.target, async () => {
+  out(`<p class="hint">Embedding memory and history on the memory GPU…</p>`);
+  const r = await post("/ui/api/memory/reindex");
+  out(`<p class="hint">Embedded ${r.memory_embedded} memory entries; created ${r.history_created} and embedded ${r.history_embedded} history excerpts.</p>`); refreshStatus();
+});
+$("#m-changes").onclick = ev => busy(ev.target, async () => {
+  const r = await api("/memory/changes?limit=40");
+  out(`<div class="panel scroll"><table><tr><th>When</th><th>Status</th><th>Operation</th><th>Entry</th><th>Title</th><th>Detail</th></tr>${r.changes.map(c => `<tr><td>${esc((c.created_at || "").replace("T", " ").slice(0, 16))}</td><td class="${c.status === "approved" ? "pass" : c.status === "rejected" ? "fail" : ""}">${esc(c.status)}</td><td>${esc(c.operation)}</td><td>${esc(c.entry_key || "")}</td><td>${esc(c.title || "")}</td><td>${esc(c.status_detail || c.reason || "")}</td></tr>`).join("")}</table></div>`);
+});
+
+/* -------------------------------------------------------- settings */
+let settings = [], edits = {};
+async function loadSettings() {
+  let r; try { r = await api("/ui/api/settings"); } catch (e) { return toast(e.message, true); }
+  settings = r.settings; edits = {};
+  if (!r.editable) $("#set-hint").textContent = "This orchestrator was started without a config file, so settings are read-only here.";
+  const groups = [...new Set(settings.map(s => s.group))];
+  $("#set-form").innerHTML = groups.map(g => `<h2>${esc(g)}</h2><div class="panel">${settings.filter(s => s.group === g).map(field).join("")}</div>`).join("");
+  $$("#set-form [data-key]").forEach(inp => inp.addEventListener(inp.type === "checkbox" || inp.tagName === "SELECT" ? "change" : "input", () => {
+    const s = settings.find(x => x.key === inp.dataset.key);
+    let v = inp.type === "checkbox" ? inp.checked : inp.value;
+    if (s.type === "int") v = parseInt(v, 10); if (s.type === "float") v = parseFloat(v);
+    if (v === s.value || (typeof v === "number" && isNaN(v))) delete edits[s.key]; else edits[s.key] = v;
+    inp.closest(".setting").classList.toggle("dirty", s.key in edits);
+    const n = Object.keys(edits).length;
+    $("#set-save").disabled = $("#set-reset").disabled = !n || !r.editable;
+    $("#set-status").textContent = n ? `${n} unsaved change${n > 1 ? "s" : ""}` : "";
+  }));
+}
+function field(s) {
+  let input;
+  if (s.type === "bool") input = `<label class="inline"><input type="checkbox" data-key="${s.key}" ${s.value ? "checked" : ""}> on</label>`;
+  else if (s.type === "choice") input = `<select data-key="${s.key}">${s.options.map(o => `<option ${o === s.value ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
+  else if (s.type === "int" || s.type === "float") input = `<input type="number" data-key="${s.key}" value="${esc(s.value)}" ${s.min != null ? `min="${s.min}"` : ""} ${s.max != null ? `max="${s.max}"` : ""} step="${s.step || 1}" style="width: 140px">`;
+  else input = `<input type="text" data-key="${s.key}" value="${esc(s.value)}" style="width: 100%">`;
+  return `<div class="setting"><div><label>${esc(s.label)}</label><code>${esc(s.key)}</code></div><div>${input}</div>
+    <div class="help">${esc(s.help)} <span class="pill ${s.live ? "live" : "restart"}">${s.live ? "applies now" : "after restart"}</span></div></div>`;
+}
+$("#set-reset").onclick = loadSettings;
+$("#set-save").onclick = ev => busy(ev.target, async () => {
+  const r = await post("/ui/api/settings", { values: edits });
+  const msg = [r.applied_now.length ? `${r.applied_now.length} applied now` : "", r.restart_required.length ? `${r.restart_required.length} after restart` : ""].filter(Boolean).join(", ");
+  toast(`Saved: ${msg || "no changes"}`);
+  await loadSettings();
+  $("#set-status").textContent = r.restart_required.length ? `Restart the orchestrator to apply: ${r.restart_required.join(", ")}` : "Saved.";
+});
+
+/* ----------------------------------------------------------- evals */
+let reports = [], selected = new Set(), pollTimer = null;
+async function loadEvals() {
+  try { reports = (await api("/ui/api/evals")).reports; } catch (e) { return toast(e.message, true); }
+  $("#ev-reports tbody").innerHTML = reports.map(r => `<tr>
+    <td><input type="checkbox" data-r="${esc(r.name)}" ${selected.has(r.name) ? "checked" : ""} aria-label="Select ${esc(r.name)}"></td>
+    <td class="num">${esc(r.name.replace("_", " "))}</td><td>${esc(r.variants.join(", "))}</td>
+    <td class="n">${r.sessions}</td><td class="n">${r.golden_cases}</td><td class="n">${r.repeats}</td>
+    <td>${r.flags.length ? `<span class="flag">${esc(r.flags.join("; "))}</span>` : ""}</td></tr>`).join("")
+    || `<tr><td colspan="7" class="hint">No reports yet. Start an evaluation above.</td></tr>`;
+  $$("#ev-reports [data-r]").forEach(c => c.onchange = () => { c.checked ? selected.add(c.dataset.r) : selected.delete(c.dataset.r); $("#ev-compare").disabled = selected.size < 1; });
+  $("#ev-compare").disabled = selected.size < 1;
+  loadCandidates(); pollRun(true);
+}
+$("#ev-run").onclick = ev => busy(ev.target, async () => {
+  await post("/ui/api/evals/run", { variants: $("#ev-variants").value.trim(), last: +$("#ev-last").value, repeats: +$("#ev-repeats").value, think: $("#ev-think").value, golden_only: $("#ev-golden").checked });
+  toast("Evaluation started"); pollRun();
+});
+async function pollRun(once = false) {
+  clearTimeout(pollTimer);
+  let s; try { s = await api("/ui/api/evals/run/status"); } catch { return; }
+  const log = $("#ev-log");
+  if (!s.log && !s.running) { log.hidden = true; return; }
+  log.hidden = false; log.textContent = (s.running ? `Running for ${s.elapsed} s…\n\n` : `Finished (exit code ${s.exit_code}).\n\n`) + s.log;
+  log.scrollTop = log.scrollHeight;
+  $("#ev-run").disabled = s.running;
+  if (s.running) pollTimer = setTimeout(pollRun, 2000);
+  else if (!once) { toast(s.exit_code === 0 ? "Evaluation finished" : s.exit_code === 3 ? "Evaluation finished with regressions flagged" : "Evaluation failed", s.exit_code !== 0); loadEvals(); }
+}
+$("#ev-compare").onclick = ev => busy(ev.target, async () => {
+  const data = await Promise.all([...selected].sort().map(n => api(`/ui/api/evals/${encodeURIComponent(n)}`)));
+  const rows = [];
+  for (const rep of data) for (const [v, r] of Object.entries(rep.variants)) rows.push({ label: `${rep.started.slice(5).replace("_", " ")} ${v}`, rep, v, r });
+  const maxTok = Math.max(1, ...rows.map(x => x.r.processed_tokens || 0));
+  const bars = (title, fn) => `<h3>${title}</h3>${rows.map(fn).join("")}`;
+  const cases = [...new Set(data.flatMap(d => (d.golden || []).map(g => g.case)))];
+  $("#ev-cmp").innerHTML = `<div class="panel">
+    ${bars("Processed prompt tokens (lower is cheaper)", x => `<div class="hbar"><span>${esc(x.label)}</span><span class="track"><span class="fill" style="width:${100 * (x.r.processed_tokens || 0) / maxTok}%"></span></span><span>${fmt(x.r.processed_tokens)}</span></div>`)}
+    ${rows.some(x => x.r.golden_total) ? bars("Golden pass rate (bracket = 95% interval)", x => {
+      if (!x.r.golden_total) return `<div class="hbar"><span>${esc(x.label)}</span><span class="hint">no golden questions</span><span></span></div>`;
+      const rate = x.r.golden_passed / x.r.golden_total, ci = x.r.golden_pass_rate_ci95 || [rate, rate];
+      return `<div class="hbar"><span>${esc(x.label)}</span><span class="track"><span class="fill m" style="width:${rate * 100}%"></span><span class="ci" style="left:${ci[0] * 100}%;width:${(ci[1] - ci[0]) * 100}%"></span></span><span>${x.r.golden_passed}/${x.r.golden_total}</span></div>`;
+    }) : ""}
+    <h3>Details</h3><div class="scroll"><table><tr><th>Run and variant</th><th class="n">Turns</th><th class="n">Processed tokens</th><th class="n">Prefill s</th><th class="n">Peak context</th><th class="n">Over window</th><th class="n">Cache hit</th><th class="n">Memory tok/turn</th><th class="n">Tool tokens saved</th><th class="n">Golden</th></tr>
+    ${rows.map(x => `<tr><td>${esc(x.label)}</td><td class="n">${fmt(x.r.turns)}</td><td class="n">${fmt(x.r.processed_tokens)}</td><td class="n">${fmt(x.r.prefill_s, 1)}</td><td class="n">${fmt(x.r.max_context_tokens)}</td><td class="n ${x.r.turns_over_ctx ? "flag" : ""}">${fmt(x.r.turns_over_ctx)}</td><td class="n">${pct(x.r.est_cache_hit)}</td><td class="n">${fmt(x.r.avg_memory_tokens)}</td><td class="n">${fmt(x.r.tool_tokens_saved)}</td><td class="n">${x.r.golden_total ? `${x.r.golden_passed}/${x.r.golden_total}` : "–"}</td></tr>`).join("")}</table></div>
+    ${cases.length ? `<h3>Golden questions</h3><div class="scroll"><table><tr><th>Question</th>${rows.map(x => `<th>${esc(x.label)}</th>`).join("")}</tr>
+      ${cases.map(c => `<tr><td>${esc(c)}</td>${rows.map(x => { const gs = (x.rep.golden || []).filter(g => g.case === c && g.variant === x.v); if (!gs.length) return "<td>–</td>"; const ok = gs.filter(g => g.passed).length; const bad = gs.find(g => !g.passed); return `<td class="${ok === gs.length ? "pass" : "fail"}" title="${esc(bad ? bad.problems.join("; ") : "")}">${gs.length > 1 ? `${ok}/${gs.length}` : ok ? "pass" : "fail"}</td>`; }).join("")}</tr>`).join("")}</table></div>` : ""}
+    ${data.flatMap(d => (d.regressions?.flags || []).map(f => `<p class="flag">${esc(d.started)}: ${esc(f)}</p>`)).join("")}
+  </div>`;
+});
+async function loadCandidates() {
+  let r; try { r = await api("/eval/candidates"); } catch (e) { return; }
+  $("#ev-cands").innerHTML = r.candidates.map(c => `<div class="panel b" data-c="${c.id}">
+    <dl class="facts"><dt>Asked</dt><dd>${esc(c.question)}</dd><dt>Answered</dt><dd>${esc(c.wrong_answer.slice(0, 300))}</dd><dt>Your correction</dt><dd>${esc(c.correction)}</dd></dl>
+    <div class="row" style="margin-top:10px"><label class="inline">Answer must contain <input type="text" data-f="expect" value="${esc(c.suggested_expect.join(", "))}" size="24"></label>
+      <label class="inline">must not contain <input type="text" data-f="forbid" value="${esc((c.suggested_forbid || []).join(", "))}" size="18"></label>
+      <button class="btn go" data-a="accept">Accept</button><button class="btn quiet" data-a="dismiss">Dismiss</button></div></div>`).join("")
+    || `<p class="hint">Nothing waiting. Corrections like “no, it's 11435” appear here.</p>`;
+  $$("#ev-cands [data-c]").forEach(p => {
+    const id = p.dataset.c, list = f => $(`[data-f=${f}]`, p).value.split(",").map(s => s.trim()).filter(Boolean);
+    $("[data-a=accept]", p).onclick = ev => busy(ev.target, async () => { const r = await post(`/ui/api/candidates/${id}/accept`, { expect: list("expect"), forbid: list("forbid") }); toast(`Added ${r.case.name} to golden.yaml`); loadCandidates(); });
+    $("[data-a=dismiss]", p).onclick = ev => busy(ev.target, async () => { await post(`/ui/api/candidates/${id}/dismiss`); loadCandidates(); });
+  });
+}
+
+/* ------------------------------------------------------------ start */
+refreshStatus(); setInterval(() => { if (!document.hidden) refreshStatus(); }, 5000);
+const initial = location.hash.slice(1); if (["overview", "chat", "memory", "settings", "evals"].includes(initial)) show(initial);
+</script>
+</body>
+</html>

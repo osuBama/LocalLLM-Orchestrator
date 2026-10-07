@@ -6,6 +6,8 @@ from fastapi.testclient import TestClient
 from app.api import create_app
 from app.schemas import Category
 
+H = {"X-AI-Client": "1"}
+
 
 @pytest.fixture
 def env(cfg, fakes):
@@ -115,7 +117,7 @@ def test_health_and_metrics(env):
     assert h["primary"]["reachable"] and h["memory"]["reachable"] and h["memory_files_ok"]
     m = client.get("/metrics").json()
     assert m["totals"]["requests"] == 1 and m["averages"]["prompt_tokens"] == 100
-    assert client.post("/memory/consolidate", params={"dry_run": True}).status_code == 200
+    assert client.post("/memory/consolidate", params={"dry_run": True}, headers=H).status_code == 200
 
 
 def test_end_to_end_memory_is_used_later(env):
@@ -138,6 +140,14 @@ def test_rebuild_replay_reset(env):
     client, orch, primary, memory = env
     client.post("/chat", json={"message": "We decided to use qwen3:8b for memory"})
     process_all(client, orch)
-    r = client.post("/memory/rebuild", json={"replay": True, "reset": True}).json()
+    r = client.post("/memory/rebuild", json={"replay": True, "reset": True}, headers=H).json()
     assert r["queued"] == 1 and orch.manager.stores[Category.lesson].entries() == []
     assert (orch.config.backups_dir).exists() and any(orch.config.backups_dir.iterdir())
+
+
+def test_admin_posts_need_the_client_header(env):
+    client, *_ = env
+    assert client.post("/memory/backup").status_code == 403          # what a foreign web page could send
+    assert client.post("/memory/backup", headers=H).status_code == 200
+    assert client.post("/chat", json={"message": "hi"}).status_code == 200      # exempt
+    assert client.post("/api/chat", json={"model": "m", "messages": [], "stream": False}).status_code != 403

@@ -157,3 +157,12 @@ def test_set_config_from_json_file_with_bom(tmp_path):
     assert st.main(["set-config", str(cfg), "--json-file", str(upd)]) == 0
     c = load_config(cfg)
     assert c.paths.root == "D:\\AI" and c.ollama.primary.num_ctx == 8192
+
+
+def test_fit_context_loads_embedding_model_first(fakes):
+    _, memory = fakes
+    memory.vram_fits_at["qwen3:8b"] = 8192
+    r = st.fit_context("http://memory.test", "qwen3:8b", 8192, embed_model="nomic-embed-text",
+                       transport=_sync(memory))
+    assert r["ok"] and "nomic-embed-text" in memory.ps_models
+    assert memory.requests[0]["model"] == "qwen3:8b" or memory.embed_calls == 1

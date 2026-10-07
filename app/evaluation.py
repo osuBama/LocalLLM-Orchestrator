@@ -54,6 +54,7 @@ BUILTIN_VARIANTS: dict[str, dict[str, Any]] = {
     # Your config.yaml exactly as it is.
     "full": {},
 }
+BUILTIN_VARIANTS["baseline"].update({"embeddings.enabled": False, "history_recall.enabled": False})
 
 # Settings the harness always forces, whatever the variant says.
 _FORCED = {"memory.worker_enabled": False, "proxy.queue_memory_updates": False,
@@ -312,6 +313,9 @@ class VariantRunner:
                                    project_id=self.orch.project_id, source="eval", turn_number=i + 1)
             self.orch.worker.enqueue_summary(task)
             self.orch.worker.enqueue_digests(task)
+            if self.orch.indexer is not None:
+                self.orch.indexer.add_history(cid, i + 1, t.user, t.assistant, list(t.tool_events))
+                self.orch.queue_embed()
             if self.extract:
                 self.orch.worker.enqueue(task)
             await self._drain()
@@ -319,21 +323,30 @@ class VariantRunner:
         return out
 
     async def golden(self, case: GoldenCase, session: EvalSession, model: str,
-                     max_answer_tokens: int, seed: int) -> GoldenResult:
+                     max_answer_tokens: int, seed: int, repeats: int = 1) -> list[GoldenResult]:
+        """Replay once, then ask `repeats` times with seeds seed, seed+1, ...
+
+        With repeats > 1 the temperature is 0.7 so different seeds actually sample
+        different answers; with a single run it is 0 (deterministic).
+        """
         turns = session.turns[: case.upto_turn] if case.upto_turn is not None else session.turns
         await self.replay(EvalSession(session.id, turns, session.source), model, None, measure=False)
         cid = f"eval-{self.name}-{session.id}"[:64]
         msgs = history_messages([*turns, EvalTurn(case.question, "")], final_tools=False)
-        try:
-            data, rec, dt = await self._send(cid, model, msgs, {"num_predict": max_answer_tokens,
-                                                               "temperature": 0, "seed": seed})
-            answer = (data.get("message") or {}).get("content", "") or ""
-            ok, problems = grade(case, answer)
-            return GoldenResult(self.name, case.name, ok, problems, answer[:2000],
-                                rec.get("prompt_tokens"), round(dt, 3))
-        except Exception as e:
-            return GoldenResult(self.name, case.name, False, ["request failed"], "", None, 0.0,
-                                f"{type(e).__name__}: {e}")
+        temperature = 0 if repeats <= 1 else 0.7
+        out = []
+        for r in range(max(1, repeats)):
+            try:
+                data, rec, dt = await self._send(cid, model, msgs, {"num_predict": max_answer_tokens,
+                                                                   "temperature": temperature, "seed": seed + r})
+                answer = (data.get("message") or {}).get("content", "") or ""
+                ok, problems = grade(case, answer)
+                out.append(GoldenResult(self.name, case.name, ok, problems, answer[:2000],
+                                        rec.get("prompt_tokens"), round(dt, 3)))
+            except Exception as e:
+                out.append(GoldenResult(self.name, case.name, False, ["request failed"], "", None, 0.0,
+                                        f"{type(e).__name__}: {e}"))
+        return out
 
 
 def _estimate_cache_hits(results: list[TurnResult], num_ctx: int | None = None) -> None:
@@ -365,7 +378,7 @@ async def run_eval(base: Config, *, variants: dict[str, dict], variant_names: li
                    sessions: list[EvalSession], golden: list[GoldenCase], max_turns: int | None = None,
                    memory: str = "current", extract: bool = False, think: bool | None = False,
                    client_system: str = DEFAULT_CLIENT_SYSTEM, max_answer_tokens: int = 512,
-                   seed: int = 42, out_dir: Path | None = None, primary_transport=None,
+                   seed: int = 42, repeats: int = 1, out_dir: Path | None = None, primary_transport=None,
                    memory_transport=None, progress=print) -> dict:
     out_dir = Path(out_dir or (base.root_dir / "evals"))
     run_dir = out_dir / "runs" / stamp()
@@ -389,6 +402,7 @@ async def run_eval(base: Config, *, variants: dict[str, dict], variant_names: li
                                primary_transport=primary_transport, memory_transport=memory_transport)
         try:
             progress(f"[{name}] warming up models…")
+            await runner._drain()          # startup vector sync for the copied memory
             try:
                 await runner.orch.primary.chat([{"role": "user", "content": "hi"}], options={"num_predict": 1})
                 await runner.orch.memory_client.chat([{"role": "user", "content": "hi"}],
@@ -412,16 +426,18 @@ async def run_eval(base: Config, *, variants: dict[str, dict], variant_names: li
                 # Each golden case gets a clean conversation id per variant run.
                 sess = EvalSession(f"{sess.id}#{case.name}", sess.turns, sess.source)
                 progress(f"[{name}] golden: {case.name}")
-                golden_results.append(await runner.golden(case, sess, model, max_answer_tokens, seed))
+                golden_results.extend(await runner.golden(case, sess, model, max_answer_tokens, seed, repeats))
         finally:
             await runner.aclose()
 
     report = summarize(variant_names, turn_results, golden_results)
     report.update(started=run_dir.name, model=model, memory_model=base.ollama.memory.model,
                   options={"max_turns": max_turns, "memory": memory, "extract": extract, "think": think,
+                           "repeats": repeats,
                            "sessions": [s.id for s in sessions], "golden_cases": [c.name for c in golden]},
                   turns=[asdict(r) for r in turn_results], golden=[asdict(g) for g in golden_results])
     out_dir.joinpath("reports").mkdir(parents=True, exist_ok=True)
+    report["regressions"] = compare_with_previous(report, out_dir / "reports")
     jpath = out_dir / "reports" / f"{run_dir.name}.json"
     mpath = out_dir / "reports" / f"{run_dir.name}.md"
     jpath.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
@@ -451,6 +467,7 @@ def summarize(variant_names: list[str], turns: list[TurnResult], golden: list[Go
             "est_cache_hit": round(sum(hits) / len(hits), 3) if hits else None,
             "golden_passed": sum(1 for g in gs if g.passed),
             "golden_total": len(gs),
+            "golden_pass_rate_ci95": wilson(sum(1 for g in gs if g.passed), len(gs)),
         }
     base = variant_names[0] if variant_names else None
     for v, r in rows.items():
@@ -460,6 +477,50 @@ def summarize(variant_names: list[str], turns: list[TurnResult], golden: list[Go
         if b and v != base and b["prefill_s"]:
             r["prefill_vs_" + base] = round(r["prefill_s"] / b["prefill_s"] - 1, 3)
     return {"baseline": base, "variants": rows}
+
+
+def wilson(passed: int, total: int, z: float = 1.96) -> list[float] | None:
+    """95% Wilson score interval for a pass rate: honest about small samples."""
+    if total == 0:
+        return None
+    p = passed / total
+    denom = 1 + z * z / total
+    centre = (p + z * z / (2 * total)) / denom
+    half = z * ((p * (1 - p) / total + z * z / (4 * total * total)) ** 0.5) / denom
+    return [round(max(0.0, centre - half), 3), round(min(1.0, centre + half), 3)]
+
+
+def compare_with_previous(report: dict, reports_dir: Path) -> dict:
+    """Compare with the most recent earlier report that ran the same variants."""
+    names = list(report["variants"])
+    prev = None
+    for p in sorted(Path(reports_dir).glob("*.json"), reverse=True):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("started") != report.get("started") and list(data.get("variants", {})) == names:
+            prev = (p.name, data)
+            break
+    if prev is None:
+        return {"previous": None, "flags": []}
+    flags = []
+    for v, r in report["variants"].items():
+        old = prev[1]["variants"].get(v) or {}
+        if r.get("golden_total") and old.get("golden_total"):
+            now_rate = r["golden_passed"] / r["golden_total"]
+            old_rate = old["golden_passed"] / old["golden_total"]
+            old_ci = old.get("golden_pass_rate_ci95") or [0, 1]
+            if now_rate < old_rate and now_rate < old_ci[0]:
+                flags.append(f"{v}: golden pass rate fell {old_rate:.0%} -> {now_rate:.0%} "
+                             f"(below the previous run's 95% interval)")
+        if r.get("processed_tokens") and old.get("processed_tokens") and r["turns"] == old.get("turns"):
+            change = r["processed_tokens"] / old["processed_tokens"] - 1
+            if change > 0.1:
+                flags.append(f"{v}: processed prompt tokens up {change:+.0%} on the same sessions")
+        if r.get("turns_over_ctx", 0) > old.get("turns_over_ctx", 0) and r["turns"] == old.get("turns"):
+            flags.append(f"{v}: turns over num_ctx {old.get('turns_over_ctx', 0)} -> {r['turns_over_ctx']}")
+    return {"previous": prev[0], "flags": flags}
 
 
 def _pct(x):
@@ -493,12 +554,27 @@ def render_markdown(report: dict) -> str:
         for case in dict.fromkeys(g["case"] for g in golden):
             cells = []
             for v in names:
-                g = next((x for x in golden if x["case"] == case and x["variant"] == v), None)
-                cells.append("" if g is None else ("pass" if g["passed"] else "FAIL: " + "; ".join(g["problems"])))
+                gs = [x for x in golden if x["case"] == case and x["variant"] == v]
+                if not gs:
+                    cells.append("")
+                elif len(gs) == 1:
+                    g = gs[0]
+                    cells.append("pass" if g["passed"] else "FAIL: " + "; ".join(g["problems"]))
+                else:
+                    n_ok = sum(1 for g in gs if g["passed"])
+                    worst = next((g for g in gs if not g["passed"]), None)
+                    cells.append(f"{n_ok}/{len(gs)}" + ("" if worst is None else f" (e.g. {'; '.join(worst['problems'])})"))
             lines.append(f"| {case} | " + " | ".join(cells) + " |")
-        lines += ["", "| variant | passed |", "|---|---|"]
+        lines += ["", "| variant | passed | 95% interval |", "|---|---|---|"]
         for v, r in report["variants"].items():
-            lines.append(f"| {v} | {r['golden_passed']}/{r['golden_total']} |")
+            ci = r.get("golden_pass_rate_ci95")
+            ci_txt = "" if not ci else f"{ci[0]:.0%}–{ci[1]:.0%}"
+            lines.append(f"| {v} | {r['golden_passed']}/{r['golden_total']} | {ci_txt} |")
+        lines += ["", "Overlapping intervals mean the difference may be noise: add cases or use --repeats."]
+    reg = report.get("regressions") or {}
+    if reg.get("previous"):
+        lines += ["", f"## Compared with {reg['previous']}", ""]
+        lines += [f"- ⚠ {f}" for f in reg["flags"]] or ["- No regressions flagged."]
     lines += ["", "**Turns over num_ctx** means the prompt did not fit the model's context window: Ollama "
               "silently drops the oldest content, so cost numbers for those turns look fine while the model "
               "has lost information. Compare accuracy with golden questions before trusting a cheaper variant.",
@@ -524,9 +600,9 @@ def accept_candidate(db, candidate_id: int, golden_path: Path, *, expect: list[s
     if cand["status"] != "pending":
         raise ValueError(f"candidate #{candidate_id} is already {cand['status']}")
     expect = list(expect or []) or list(cand["suggested_expect"])
-    forbid = list(forbid or [])
+    forbid = list(forbid or []) or list(cand.get("suggested_forbid") or [])
     if not expect and not forbid:
-        raise ValueError("no expectation suggested for this candidate; pass --expect (and/or --forbid)")
+        raise ValueError("nothing to check: no expectation was suggested; pass --expect (and/or --forbid)")
     name = name or f"correction-{candidate_id}"
     case = {"name": name, "session": cand["conversation_id"], "upto_turn": max(0, cand["turn"] - 2),
             "question": cand["question"]}

@@ -18,6 +18,7 @@
 param(
     [string]$PrimaryModel = "",
     [string]$MemoryModel = "",
+    [string]$EmbeddingModel = "nomic-embed-text",   # "" or "none" disables semantic search/history recall
     [int]$PrimaryContext = 0,          # starting point for fitting; 0 = from the VRAM plan
     [int]$MemoryContext = 0,
     [string]$PrimaryGpu = "",          # GPU UUIDs (see: nvidia-smi -L); empty = larger VRAM is primary
@@ -168,7 +169,7 @@ $gArgs = @("detect-gpus")
 if ($PrimaryGpu) { $gArgs += @("--primary-uuid", $PrimaryGpu) }
 if ($MemoryGpu)  { $gArgs += @("--memory-uuid", $MemoryGpu) }
 $det = Tool $gArgs
-if (-not $det.ok) { Fail "No NVIDIA GPU detected: $($det.error). (AMD/Linux: see README section 4.)" }
+if (-not $det.ok) { Fail "No NVIDIA GPU detected: $($det.error). (AMD/Linux: see docs\DOCUMENTATION.md section 4.)" }
 foreach ($g in $det.gpus) { Info ("{0}  {1,-34} {2,5} GB  {3}" -f $g.index, $g.name, $g.vram_gb, $g.uuid) }
 $mode = $det.roles.mode
 if ($SingleGpu) { $mode = "single" }
@@ -177,7 +178,7 @@ $mg = if ($mode -eq "single") { $pg } else { $det.roles.memory }
 if ($mode -eq "dual") {
     Ok "Primary: $($pg.name) ($($pg.vram_gb) GB)   Memory: $($mg.name) ($($mg.vram_gb) GB)"
 } else {
-    Warn "Single-GPU mode on $($pg.name): both models share it, no isolation (README 4.4)."
+    Warn "Single-GPU mode on $($pg.name): both models share it, no isolation (docs\DOCUMENTATION.md 4.4)."
 }
 $script:Summary["GPU mode"] = $mode
 
@@ -237,10 +238,11 @@ Info "Suggested from VRAM ($desktopGb GB already in use on the primary):"
 Info "  primary $($plan.primary_model) @ $($plan.primary_ctx) ctx    memory $($plan.memory_model) @ $($plan.memory_ctx) ctx"
 if (-not $PrimaryModel) { $PrimaryModel = AskValue "Primary model" $plan.primary_model }
 if (-not $MemoryModel)  { $MemoryModel  = AskValue "Memory model"  $plan.memory_model }
+if ($EmbeddingModel -eq "none") { $EmbeddingModel = "" }
 if (-not $PrimaryContext) { $PrimaryContext = [int]$plan.primary_ctx }
 if (-not $MemoryContext)  { $MemoryContext  = [int]$plan.memory_ctx }
-Ok "Primary $PrimaryModel   Memory $MemoryModel"
-$script:Summary["Models"] = "$PrimaryModel / $MemoryModel"
+Ok "Primary $PrimaryModel   Memory $MemoryModel   Embeddings $(if ($EmbeddingModel) { $EmbeddingModel } else { 'off' })"
+$script:Summary["Models"] = "$PrimaryModel / $MemoryModel$(if ($EmbeddingModel) { " / $EmbeddingModel" })"
 
 # -------------------------------------------------------- 5. pinned instances
 Step "Pinned Ollama instances"
@@ -262,7 +264,7 @@ foreach ($port in @($PrimaryPort, $memPort) | Select-Object -Unique) {
 Step "Models download"
 if ($SkipPull) { Info "Skipped (-SkipPull)" }
 else {
-    foreach ($m in @($PrimaryModel, $MemoryModel) | Select-Object -Unique) {
+    foreach ($m in @($PrimaryModel, $MemoryModel, $EmbeddingModel) | Where-Object { $_ } | Select-Object -Unique) {
         $env:OLLAMA_HOST = "127.0.0.1:$PrimaryPort"
         & ollama pull $m
         $code = $LASTEXITCODE
@@ -278,14 +280,19 @@ if ($SkipFit) {
     Info "Skipped (-SkipFit): using $PrimaryContext / $MemoryContext"
 } else {
     Info "Loading each model and stepping num_ctx down until it sits fully on its GPU..."
-    $mfit = Tool @("fit-context", "--base-url", "http://127.0.0.1:$memPort", "--model", $MemoryModel,
-                   "--start", "$MemoryContext")
+    $mfArgs = @("fit-context", "--base-url", "http://127.0.0.1:$memPort", "--model", $MemoryModel,
+                "--start", "$MemoryContext")
+    if ($EmbeddingModel) { $mfArgs += @("--embed-model", $EmbeddingModel) }   # shares the memory GPU
+    $mfit = Tool $mfArgs
     if (-not $mfit.ok) { Fail "$($mfit.error) (re-run with -MemoryModel <smaller>)" }
     $MemoryContext = [int]$mfit.num_ctx
     Ok "$MemoryModel  num_ctx $MemoryContext  ($($mfit.vram_gb) GB)"
     $pfArgs = @("fit-context", "--base-url", "http://127.0.0.1:$PrimaryPort", "--model", $PrimaryModel,
                 "--start", "$PrimaryContext")
-    if ($mode -eq "single") { $pfArgs += @("--keep", $MemoryModel) }
+    if ($mode -eq "single") {
+        $pfArgs += @("--keep", $MemoryModel)
+        if ($EmbeddingModel) { $pfArgs += @("--keep", $EmbeddingModel) }
+    }
     $pfit = Tool $pfArgs
     if (-not $pfit.ok) { Fail "$($pfit.error) (re-run with -PrimaryModel <smaller>)" }
     $PrimaryContext = [int]$pfit.num_ctx
@@ -306,6 +313,8 @@ $updates = [ordered]@{
     "ollama.memory.num_ctx"         = $MemoryContext
     "memory.max_context_tokens"     = [int]$bud.memory_budget
     "stable_memory.max_tokens"      = [int]$bud.memory_base_budget
+    "embeddings.enabled"            = [bool]$EmbeddingModel
+    "embeddings.model"              = $(if ($EmbeddingModel) { $EmbeddingModel } else { "nomic-embed-text" })
     "application.host"              = "127.0.0.1"
     "application.port"              = $OrchestratorPort
 }
@@ -337,6 +346,15 @@ else {
     if (-not $health) { Fail "Orchestrator did not answer on port $OrchestratorPort (see logs\orchestrator.log)." }
     Ok "http://127.0.0.1:$OrchestratorPort  status: $($health.status)"
     foreach ($w in @($health.warnings)) { if ($w) { Warn $w } }
+    if ($EmbeddingModel -and (Test-Path (Join-Path $Root "conversations\*.jsonl"))) {
+        Info "Existing conversation history can be made searchable (history recall). This embeds every"
+        Info "recorded turn on the memory GPU and can take a few minutes for large histories."
+        if (Ask "Index existing history now?" $true) {
+            $env:PYTHONPATH = $Root
+            & $Py -m app.cli memory reindex
+            if ($LASTEXITCODE -eq 0) { Ok "History indexed" } else { Warn "Reindex failed; run '.\ai memory reindex' later" }
+        }
+    }
 }
 
 # ------------------------------------------------------------------ 10. WSL
@@ -347,7 +365,7 @@ elseif (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) { Warn "WSL no
 elseif ($SkipWsl) { Info "Skipped (-SkipWsl)"; $wslOk = $true }
 elseif ($build -lt 22621) {
     Warn "Mirrored networking needs Windows 11 22H2+ (build 22621). OpenClaw in WSL cannot reach 127.0.0.1:$OrchestratorPort."
-    Info "Options: upgrade Windows, or run OpenClaw on Windows. See README 7.3."
+    Info "Options: upgrade Windows, or run OpenClaw on Windows. See docs\DOCUMENTATION.md 7.3."
 } else {
     $wslcfg = Join-Path $env:USERPROFILE ".wslconfig"
     $text = if (Test-Path $wslcfg) { [IO.File]::ReadAllText($wslcfg) } else { "" }
@@ -430,7 +448,7 @@ else {
                 Wsl-Bash $distro (@('mkdir -p "$HOME/.openclaw"', (Heredoc '"$HOME/.openclaw/orchestrator-provider.json"' $patch)) -join "`n") | Out-Null
                 Warn "This OpenClaw version accepted neither 'config patch' nor 'config set':"
                 Warn ((@($r.Out.Trim() -split "`n") | Select-Object -Last 2) -join " ")
-                Warn "Merge ~/.openclaw/orchestrator-provider.json into your OpenClaw config by hand (README 7.2)."
+                Warn "Merge ~/.openclaw/orchestrator-provider.json into your OpenClaw config by hand (docs\DOCUMENTATION.md 7.2)."
             } else {
                 $rs = Wsl-Bash $distro 'openclaw gateway restart'
                 if ($rs.Code -eq 0) { Ok "Gateway restarted" } else { Warn "Restart the gateway yourself: openclaw gateway restart" }
@@ -475,11 +493,12 @@ if ($doAuto) {
 Write-Host ""
 Write-Host "Setup complete" -ForegroundColor Green
 $script:Summary["Orchestrator"] = "http://127.0.0.1:$OrchestratorPort  (Ollama-compatible; point clients here)"
+$script:Summary["Console"] = "http://127.0.0.1:$OrchestratorPort/ui  (or .\ai ui)"
 $script:Summary["Ollama"] = if ($mode -eq "single") { "127.0.0.1:$PrimaryPort" } else { "primary 127.0.0.1:$PrimaryPort, memory 127.0.0.1:$MemoryPort" }
 $script:Summary["Config"] = "config\config.yaml (backup next to it)"
 if (Test-Path $BackupDir) { $script:Summary["Backups"] = $BackupDir }
 foreach ($k in $script:Summary.Keys) { Write-Host ("  {0,-13} {1}" -f $k, $script:Summary[$k]) }
 Write-Host ""
-Write-Host "Next:  .\ai status    .\ai chat -v    .\ai eval sessions    (README sections 6, 7, 11)"
+Write-Host "Next:  .\ai ui    .\ai status    .\ai chat -v    .\ai eval sessions    (docs\DOCUMENTATION.md sections 6, 7, 10, 12)"
 Write-Host "Re-run .\setup.ps1 any time; it is safe to repeat. Instance launch arguments are in this log."
 try { Stop-Transcript | Out-Null } catch { }

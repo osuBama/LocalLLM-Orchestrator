@@ -240,7 +240,8 @@ def _ps_entry(client: httpx.Client, model: str) -> dict | None:
 
 
 def fit_context(base_url: str, model: str, start: int, *, minimum: int = 4096, keep: list[str] | None = None,
-                transport: httpx.BaseTransport | None = None, timeout: float = 600) -> dict:
+                embed_model: str | None = None, transport: httpx.BaseTransport | None = None,
+                timeout: float = 600) -> dict:
     """Largest num_ctx (from `start` downwards) at which `model` loads 100% on GPU.
 
     `keep`: models that must stay loaded alongside (single-GPU mode); they are
@@ -254,7 +255,17 @@ def fit_context(base_url: str, model: str, start: int, *, minimum: int = 4096, k
     if not candidates or candidates[-1] != minimum:
         candidates.append(minimum)
     tried = []
+    keep = list(keep or [])
     with httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout, transport=transport) as client:
+        if embed_model:
+            # The embedding model shares this GPU: load it first so the fit leaves room for it.
+            try:
+                client.post("/api/embed", json={"model": embed_model, "input": "warm-up",
+                                                "keep_alive": "10m"}).raise_for_status()
+                keep.append(embed_model)
+            except httpx.HTTPError as e:
+                return {"ok": False, "model": model, "num_ctx": None, "tried": [],
+                        "error": f"could not load embedding model {embed_model}: {e}"}
         for ctx in candidates:
             try:
                 r = client.post("/api/generate", json={"model": model, "prompt": "", "keep_alive": "10m",
@@ -315,6 +326,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--start", type=int, required=True)
     s.add_argument("--minimum", type=int, default=4096)
     s.add_argument("--keep", action="append", default=[])
+    s.add_argument("--embed-model", help="embedding model sharing this GPU (loaded first)")
     s = sp.add_parser("openclaw-patch")
     s.add_argument("--model", required=True)
     s.add_argument("--ctx", type=int, required=True)
@@ -339,7 +351,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("nothing to set")
             out = set_config(Path(a.path), updates)
         elif a.cmd == "fit-context":
-            out = fit_context(a.base_url, a.model, a.start, minimum=a.minimum, keep=a.keep)
+            out = fit_context(a.base_url, a.model, a.start, minimum=a.minimum, keep=a.keep,
+                              embed_model=a.embed_model)
         else:
             out = openclaw_patch(a.model, a.ctx, a.base_url)
             if a.provider_only:

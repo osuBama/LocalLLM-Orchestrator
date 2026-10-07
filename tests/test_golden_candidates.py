@@ -108,3 +108,17 @@ def test_cli_candidates_accept_dismiss(env, cfg, tmp_path, capsys):
     assert cli_main(["--config", str(p), "eval", "dismiss", "2"]) == 0
     assert [c["status"] for c in orch.db.candidates(status=None)] == ["dismissed", "accepted"]
     assert client.get("/eval/candidates", params={"all": True}).json()["candidates"][0]["status"] == "dismissed"
+
+
+def test_negated_values_become_forbid_not_expect(env):
+    client, orch, primary = env
+    body = convo(("which port is the memory instance on?", "It listens on 11435 most likely."),
+                 ("no, it's 11436, not 11435", None))
+    client.post("/api/chat", json=body, headers={"X-Conversation-Id": "neg"})
+    [c] = orch.db.candidates()
+    assert c["suggested_expect"] == ["11436"]
+    assert c["suggested_forbid"] == ["/\\b11435\\b/"]
+    case = ev.accept_candidate(orch.db, c["id"], orch.config.root_dir / "g.yaml")["case"]
+    ok, _ = ev.grade(ev.GoldenCase(**case), "It is on port 11436.")
+    bad, problems = ev.grade(ev.GoldenCase(**case), "Port 11435.")
+    assert ok and not bad and any("forbidden" in p for p in problems)

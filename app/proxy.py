@@ -305,9 +305,12 @@ def build_router(orch: Orchestrator) -> APIRouter:
             size_state.popitem(last=False)
         return cut, boundary, size
 
+    def plan_key(conversation_id: str, turn: int, user_text: str) -> tuple:
+        return (conversation_id, turn, hash(user_text))
+
     def plan_for(conversation_id: str, turn: int, user_text: str, original: list[dict],
-                 tools_chars: int = 0, client_think=None, model: str = "") -> TurnPlan:
-        key = (conversation_id, turn, hash(user_text))
+                 tools_chars: int = 0, client_think=None, model: str = "", qvec=None) -> TurnPlan:
+        key = plan_key(conversation_id, turn, user_text)
         if key in plans:
             plans.move_to_end(key)
             return plans[key]
@@ -341,10 +344,12 @@ def build_router(orch: Orchestrator) -> APIRouter:
 
         if cfg.proxy.inject_memory:
             budget = cfg.memory.max_context_tokens - (base.tokens if base else 0)
+            # Older exchanges, excluding turns of this conversation still verbatim in the prompt.
+            history = orch.recall_history(user_text, qvec, conversation_id, drop)
             ctx = orch.context_builder.build(
                 user_text, max_tokens=budget, base=base,
                 session_summary=summary["summary"] if (drop and summary) else None,
-                preamble=not cfg.proxy.append_system_prompt)
+                preamble=not cfg.proxy.append_system_prompt, query_vec=qvec, history=history)
         else:
             ctx = BuiltContext("", 0)
         plan = TurnPlan(drop, ctx, covered, boundary=boundary, base=base, est_size=est_size)
@@ -359,7 +364,7 @@ def build_router(orch: Orchestrator) -> APIRouter:
             plans.popitem(last=False)
         return plan
 
-    def prepare(body: dict, conversation_id: str) -> tuple[dict, dict]:
+    async def prepare(body: dict, conversation_id: str) -> tuple[dict, dict]:
         """Return (outgoing body, info about the turn)."""
         out = copy.deepcopy(body)
         original: list[dict] = list(body.get("messages") or [])
@@ -371,8 +376,11 @@ def build_router(orch: Orchestrator) -> APIRouter:
         if isinstance(user_text, str):
             turn = sum(1 for m in original if m.get("role") == "user")
             tools_chars = len(json.dumps(body["tools"], ensure_ascii=False)) if body.get("tools") else 0
+            qvec = None
+            if plan_key(conversation_id, turn, user_text) not in plans and cfg.proxy.inject_memory:
+                qvec = await orch.query_vector(user_text)     # once per turn; None -> keywords only
             plan = plan_for(conversation_id, turn, user_text, original, tools_chars, body.get("think"),
-                            str(body.get("model") or ""))
+                            str(body.get("model") or ""), qvec)
             info.update(user_text=user_text, user_index_original=uidx, turn=turn, plan=plan)
             messages = drop_user_turns(original, plan.drop)
             info["trimmed"] = len(original) - len(messages)
@@ -494,7 +502,7 @@ def build_router(orch: Orchestrator) -> APIRouter:
         request_id = uuid.uuid4().hex[:12]
         orch.touch()
         conversation_id = conversation_id_for(request, body)
-        out, info = prepare(body, conversation_id)
+        out, info = await prepare(body, conversation_id)
         stream = out.get("stream", True) is not False
         t0 = time.perf_counter()
         headers = {"content-type": "application/json"}

@@ -1,6 +1,7 @@
 """Administration CLI (spec §42).
 
     ai serve
+    ai ui                             # open the web console
     ai chat
     ai status | ai metrics
     ai memory show [category]
@@ -149,6 +150,28 @@ def cmd_memory(cfg, args) -> int:
             for r in rows:
                 print(f"[{r['entry_id']}] {r['title']}  (created {r['created_at'][:10]}, "
                       f"last used {(r['last_used_at'] or 'never')[:10]}, used {r['use_count']}x)")
+        elif sub == "reindex":
+            if orch.indexer is None:
+                print("Embeddings are disabled (embeddings.enabled: false).")
+                return 2
+
+            async def go():
+                m = await orch.indexer.sync_memory()
+                created = orch.indexer.backfill_history_from_logs() if not args.memory_only else 0
+                h = 0
+                while not args.memory_only:
+                    n = await orch.indexer.sync_history()
+                    if not n:
+                        break
+                    h += n
+                    print(f"  embedded {h} history chunks...", flush=True)
+                return m, created, h
+            try:
+                m, created, h = asyncio.run(go())
+            except Exception as e:
+                print(f"Reindex failed: {e}. Is the memory Ollama instance running with {cfg.embeddings.model} pulled?")
+                return 1
+            print(f"memory entries embedded: {m}; history chunks created: {created}, embedded: {h}")
         elif sub == "restore":
             _print(orch.manager.restore(args.backup_dir))
         return 0
@@ -172,7 +195,8 @@ def cmd_eval(cfg, args) -> int:
                 print(f"   asked:      {r['question'][:100]!r}")
                 print(f"   answered:   {r['wrong_answer'][:100]!r}")
                 print(f"   correction: {r['correction'][:100]!r}")
-                print(f"   suggested expect_all: {r['suggested_expect'] or '(none: pass --expect)'}")
+                print(f"   suggested expect_all: {r['suggested_expect'] or '(none)'}")
+                print(f"   suggested forbid:     {r.get('suggested_forbid') or '(none)'}")
             return 0
         if args.eval_cmd == "dismiss":
             ok = db.set_candidate_status(args.id, "dismissed")
@@ -215,7 +239,7 @@ def cmd_eval(cfg, args) -> int:
         sessions = pool[-args.last:] if args.last else []
     if not sessions and not golden:
         print("Nothing to evaluate: no recorded sessions selected and no golden cases "
-              f"({golden_path}). See README §11.")
+              f"({golden_path}). See docs/DOCUMENTATION.md §12.")
         return 2
 
     try:
@@ -232,10 +256,13 @@ def cmd_eval(cfg, args) -> int:
         cfg, variants=variants, variant_names=names, sessions=sessions, golden=golden,
         max_turns=args.max_turns, memory=args.memory, extract=args.extract,
         think=None if args.think == "default" else args.think == "on", client_system=client_system,
-        max_answer_tokens=args.max_answer_tokens or (512 if args.think == "off" else 4096), seed=args.seed))
+        max_answer_tokens=args.max_answer_tokens or (512 if args.think == "off" else 4096), seed=args.seed,
+        repeats=args.repeats))
     print()
     print(Path(report["files"]["markdown"]).read_text(encoding="utf-8"))
     print(f"Report: {report['files']['markdown']}\nJSON:   {report['files']['json']}")
+    if report.get("regressions", {}).get("flags"):
+        return 3
     return 0
 
 
@@ -245,6 +272,7 @@ def main(argv: list[str] | None = None) -> int:
     sp = p.add_subparsers(dest="cmd", required=True)
 
     sp.add_parser("serve", help="run the orchestrator server")
+    sp.add_parser("ui", help="open the web console in your browser")
     c = sp.add_parser("chat", help="interactive chat through the running server")
     c.add_argument("--conversation-id")
     c.add_argument("-v", "--verbose", action="store_true")
@@ -275,10 +303,12 @@ def main(argv: list[str] | None = None) -> int:
     s = msp.add_parser("consolidate", help="merge duplicates / tighten long entries now")
     s.add_argument("--dry-run", action="store_true", help="show proposals without applying")
     msp.add_parser("review", help="active entries unused for consolidation.stale_after_days")
+    s = msp.add_parser("reindex", help="(re)build embeddings for memory and all recorded history")
+    s.add_argument("--memory-only", action="store_true")
     s = msp.add_parser("restore", help="restore memory files from a backups\\... snapshot")
     s.add_argument("backup_dir")
 
-    e = sp.add_parser("eval", help="evaluation harness (README §11)")
+    e = sp.add_parser("eval", help="evaluation harness (docs/DOCUMENTATION.md §12)")
     esp = e.add_subparsers(dest="eval_cmd", required=True)
     esp.add_parser("sessions", help="list recorded sessions available for replay")
     s = esp.add_parser("candidates", help="corrections captured as golden-question candidates")
@@ -309,6 +339,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--max-answer-tokens", type=int,
                    help="default 512 with --think off, 4096 otherwise (thinking counts toward the limit)")
     s.add_argument("--seed", type=int, default=42)
+    s.add_argument("--repeats", type=int, default=1,
+                   help="ask each golden question N times (seeds seed..seed+N-1, temperature 0.7)")
 
     args = p.parse_args(argv)
     cfg = load_config(args.config)
@@ -318,6 +350,17 @@ def main(argv: list[str] | None = None) -> int:
         from .api import create_app
         uvicorn.run(create_app(cfg), host=cfg.application.host, port=cfg.application.port,
                     log_level=cfg.application.log_level.lower())
+        return 0
+    if args.cmd == "ui":
+        import webbrowser
+        url = _server(cfg) + "/ui"
+        try:
+            httpx.get(_server(cfg) + "/health", timeout=3)
+        except httpx.HTTPError:
+            print(f"The orchestrator isn't running at {_server(cfg)}. Start it first (scripts\\start-orchestrator.ps1).")
+            return 1
+        print(f"Opening {url}")
+        webbrowser.open(url)
         return 0
     if args.cmd == "chat":
         return cmd_chat(cfg, args)

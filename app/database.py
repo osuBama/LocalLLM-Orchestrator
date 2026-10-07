@@ -107,8 +107,28 @@ CREATE TABLE IF NOT EXISTS golden_candidates (
     wrong_answer TEXT NOT NULL,
     correction TEXT NOT NULL,
     suggested_expect TEXT NOT NULL DEFAULT '[]',
+    suggested_forbid TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','accepted','dismissed')),
     case_name TEXT
+);
+
+CREATE TABLE IF NOT EXISTS vectors (
+    kind TEXT NOT NULL,           -- 'memory' | 'history'
+    key TEXT NOT NULL,
+    model TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    vec BLOB NOT NULL,            -- float32, L2-normalised
+    text_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (kind, key, model)
+);
+
+CREATE TABLE IF NOT EXISTS history_chunks (
+    key TEXT PRIMARY KEY,         -- conversation_id:turn
+    conversation_id TEXT NOT NULL,
+    turn INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    text TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON memory_tasks(status, next_attempt_at);
@@ -124,6 +144,9 @@ class Database:
         with self.connect() as c:
             c.executescript(SCHEMA)
             cols = {r["name"] for r in c.execute("PRAGMA table_info(memory_tasks)")}
+            gcols = {r["name"] for r in c.execute("PRAGMA table_info(golden_candidates)")}
+            if gcols and "suggested_forbid" not in gcols:  # migration from 0.10/0.11
+                c.execute("ALTER TABLE golden_candidates ADD COLUMN suggested_forbid TEXT NOT NULL DEFAULT '[]'")
             if "priority" not in cols:  # migration from 0.2.0
                 c.execute("ALTER TABLE memory_tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
                 c.execute("ALTER TABLE memory_tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'extract'")
@@ -321,6 +344,11 @@ class Database:
         with self.connect() as c:
             return int(c.execute(q, args).fetchone()["n"])
 
+    def has_pending_task(self, kind: str) -> bool:
+        with self.connect() as c:
+            return c.execute("SELECT 1 FROM memory_tasks WHERE kind=? AND status='pending' LIMIT 1",
+                             (kind,)).fetchone() is not None
+
     def pending_task_count(self) -> int:
         with self.connect() as c:
             return int(c.execute("SELECT COUNT(*) n FROM memory_tasks WHERE status IN ('pending','processing')")
@@ -328,7 +356,7 @@ class Database:
 
     # ------------------------------------------------------ golden candidates
     def add_candidate(self, conversation_id: str, turn: int, question: str, wrong_answer: str,
-                      correction: str, suggested: list[str]) -> int:
+                      correction: str, suggested: list[str], suggested_forbid: list[str] | None = None) -> int:
         with self.connect() as c:
             dup = c.execute("SELECT id FROM golden_candidates WHERE conversation_id=? AND turn=?",
                             (conversation_id, turn)).fetchone()
@@ -336,9 +364,9 @@ class Database:
                 return int(dup["id"])
             cur = c.execute(
                 """INSERT INTO golden_candidates (created_at, conversation_id, turn, question, wrong_answer,
-                       correction, suggested_expect) VALUES (?,?,?,?,?,?,?)""",
+                       correction, suggested_expect, suggested_forbid) VALUES (?,?,?,?,?,?,?,?)""",
                 (now_iso(), conversation_id, turn, question, wrong_answer, correction,
-                 json.dumps(suggested, ensure_ascii=False)))
+                 json.dumps(suggested, ensure_ascii=False), json.dumps(suggested_forbid or [], ensure_ascii=False)))
             return int(cur.lastrowid)
 
     def candidates(self, status: str | None = "pending", limit: int = 100) -> list[dict]:
@@ -350,12 +378,51 @@ class Database:
             rows = [dict(r) for r in c.execute(q + " ORDER BY id DESC LIMIT ?", (*args, limit))]
         for r in rows:
             r["suggested_expect"] = json.loads(r["suggested_expect"] or "[]")
+            r["suggested_forbid"] = json.loads(r.get("suggested_forbid") or "[]")
         return rows
 
     def set_candidate_status(self, cid: int, status: str, case_name: str | None = None) -> bool:
         with self.connect() as c:
             return c.execute("UPDATE golden_candidates SET status=?, case_name=COALESCE(?, case_name) WHERE id=?",
                              (status, case_name, cid)).rowcount > 0
+
+    # ---------------------------------------------------------------- vectors
+    def vector_hashes(self, kind: str, model: str) -> dict[str, str]:
+        with self.connect() as c:
+            return {r["key"]: r["text_hash"] for r in c.execute(
+                "SELECT key, text_hash FROM vectors WHERE kind=? AND model=?", (kind, model))}
+
+    def upsert_vectors(self, kind: str, model: str, rows: list[tuple[str, bytes, int, str]]) -> None:
+        ts = now_iso()
+        with self.connect() as c:
+            c.executemany("INSERT OR REPLACE INTO vectors (kind, key, model, dim, vec, text_hash, created_at) "
+                          "VALUES (?,?,?,?,?,?,?)", [(kind, k, model, d, v, h, ts) for k, v, d, h in rows])
+
+    def delete_vectors(self, kind: str, model: str, keys: list[str]) -> None:
+        with self.connect() as c:
+            c.executemany("DELETE FROM vectors WHERE kind=? AND model=? AND key=?", [(kind, model, k) for k in keys])
+
+    def load_vectors(self, kind: str, model: str) -> list[tuple[str, bytes, int]]:
+        with self.connect() as c:
+            return [(r["key"], r["vec"], r["dim"]) for r in c.execute(
+                "SELECT key, vec, dim FROM vectors WHERE kind=? AND model=? ORDER BY key", (kind, model))]
+
+    def add_history_chunk(self, key: str, conversation_id: str, turn: int, text: str) -> bool:
+        with self.connect() as c:
+            return c.execute("INSERT OR IGNORE INTO history_chunks (key, conversation_id, turn, created_at, text) "
+                             "VALUES (?,?,?,?,?)", (key, conversation_id, turn, now_iso(), text)).rowcount > 0
+
+    def history_chunks(self, keys: list[str] | None = None) -> dict[str, dict]:
+        with self.connect() as c:
+            if keys is None:
+                rows = c.execute("SELECT * FROM history_chunks")
+                return {r["key"]: dict(r) for r in rows}
+            out: dict[str, dict] = {}
+            for i in range(0, len(keys), 500):
+                chunk = keys[i:i + 500]
+                out.update({r["key"]: dict(r) for r in c.execute(
+                    f"SELECT * FROM history_chunks WHERE key IN ({','.join('?' * len(chunk))})", chunk)})
+            return out
 
     # ------------------------------------------------------------ tool digests
     def get_digests(self, hashes: list[str]) -> dict[str, dict]:

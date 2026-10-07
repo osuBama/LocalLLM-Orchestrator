@@ -65,6 +65,7 @@ class MemoryWorker:
         self._stopping = False
         self.idle_hook = None          # async () -> bool; runs only when the queue is empty
         self.lock = asyncio.Lock()     # one memory-GPU job at a time (tasks, consolidation, API)
+        self.indexer = None            # set by the orchestrator when embeddings are enabled
 
     # -------------------------------------------------------------- queue
     def enqueue(self, task: InteractionTask, force: bool = False) -> tuple[int, bool, list[str]]:
@@ -164,6 +165,17 @@ class MemoryWorker:
             return False
         task_id = claimed["id"]
         t0 = time.perf_counter()
+        if claimed.get("kind") == "embed":
+            try:
+                if self.indexer is not None:
+                    await self.indexer.sync_memory()
+                    while await self.indexer.sync_history():
+                        pass
+            except Exception as e:
+                self._fail(claimed, e, time.perf_counter() - t0)
+                return True
+            self.db.finish_task(task_id, "done", duration=time.perf_counter() - t0)
+            return True
         if claimed.get("kind") == "digest":
             try:
                 await self.process_digest(claimed["payload"])
@@ -196,6 +208,9 @@ class MemoryWorker:
             return True
         dur = time.perf_counter() - t0
         self.db.finish_task(task_id, "done", duration=dur)
+        if self.indexer is not None and any(a.status == "approved" for a in applied) \
+                and not self.db.has_pending_task("embed"):
+            self.db.enqueue_task({"conversation_id": None}, kind="embed", priority=8)
         if self.metrics:
             self.metrics.record_memory(dur, "done", len([a for a in applied if a.status == "approved"]))
         return True

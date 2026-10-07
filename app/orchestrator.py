@@ -19,7 +19,7 @@ from .flags import strip_flags
 from .conversation_logger import ConversationLogger
 from .database import Database
 from .memory_manager import MemoryManager
-from .memory_retriever import KeywordRetriever
+from .memory_retriever import HybridRetriever, KeywordRetriever
 from .memory_worker import MemoryWorker
 from .metrics import Metrics
 from .ollama_client import OllamaClient, OllamaError
@@ -40,7 +40,22 @@ class Orchestrator:
         self.conv_log = ConversationLogger(config.conversations_dir, config.conversation.retain_raw_history)
         self.manager = MemoryManager(config, self.db)
         self.manager.ensure_files()
-        self.retriever = KeywordRetriever(self.manager.stores)
+        self.embedder = None
+        self.indexer = None
+        if config.embeddings.enabled:
+            from .embeddings import Embedder, Indexer
+            emb_url = config.embeddings.base_url or config.ollama.memory.base_url
+            emb_transport = memory_transport if emb_url == config.ollama.memory.base_url else None
+            self.embedder = Embedder(emb_url, config.embeddings.model,
+                                     query_prefix=config.embeddings.query_prefix,
+                                     document_prefix=config.embeddings.document_prefix,
+                                     timeout=config.embeddings.timeout_seconds, transport=emb_transport)
+        if self.embedder is not None and config.memory.enable_semantic_retrieval:
+            from .embeddings import VectorIndex
+            self.retriever = HybridRetriever(self.manager.stores, VectorIndex(self.db, self.embedder.model),
+                                             config.embeddings.min_similarity)
+        else:
+            self.retriever = KeywordRetriever(self.manager.stores)
         self.context_builder = ContextBuilder(
             self.manager.stores, self.retriever, config.prompt("context_builder.txt"),
             config.memory.max_context_tokens, config.memory.max_entry_tokens)
@@ -51,6 +66,13 @@ class Orchestrator:
         self.calibrator = TokenCalibrator(self.db)
         self.worker = MemoryWorker(config, self.db, self.manager, self.memory_client,
                                    self.context_builder, self.metrics)
+        if self.embedder is not None:
+            from .embeddings import Indexer
+            self.indexer = Indexer(self, self.embedder)
+            if isinstance(self.retriever, HybridRetriever):
+                self.indexer.index = self.retriever.index     # one shared, cache-invalidated index
+            self.worker.indexer = self.indexer
+            self.queue_embed()                                 # bring vectors up to date at startup
         self.primary_system = config.prompt("primary_system.txt")
         if config.flags.enabled:
             self.primary_system += "\n\n" + config.prompt("primary_flags.txt")
@@ -66,12 +88,38 @@ class Orchestrator:
         await self.worker.stop()
         await self.primary.aclose()
         await self.memory_client.aclose()
+        if self.embedder is not None:
+            await self.embedder.aclose()
+
+    def queue_embed(self) -> None:
+        """Queue a background vector sync (memory entries + new history chunks), once."""
+        if self.indexer is not None and not self.db.has_pending_task("embed"):
+            self.db.enqueue_task({"conversation_id": None}, kind="embed", priority=8)
+            self.worker._wake.set()
+
+    async def query_vector(self, text: str):
+        if self.embedder is None or not text:
+            return None
+        return await self.embedder.query(text)
+
+    def recall_history(self, query: str, qvec, conversation_id: str, in_prompt_after_turn: int) -> list[dict]:
+        if self.indexer is None:
+            return []
+        try:
+            return self.indexer.recall(query, qvec, conversation_id, in_prompt_after_turn)
+        except Exception:
+            log.exception("history recall failed")
+            return []
 
     # ------------------------------------------------------------ memory
     async def queue_memory(self, task: InteractionTask) -> bool:
         """Queue the session-summary update and (if triggered) memory extraction."""
         self.worker.enqueue_summary(task)
         self.worker.enqueue_digests(task)
+        if self.indexer is not None:
+            self.indexer.add_history(task.conversation_id, task.turn_number, task.user_message,
+                                     task.assistant_response, task.tool_events)
+            self.queue_embed()
         _, queued, _ = self.worker.enqueue(task)
         if not self.config.memory.asynchronous_updates:
             # Synchronous mode (debugging): process inline, still isolated from errors.
@@ -107,7 +155,8 @@ class Orchestrator:
 
     def record_usage(self, entry_ids) -> None:
         try:
-            self.db.record_usage([i for i in entry_ids if i not in ("SESSION", "UPDATES")], self.project_id)
+            self.db.record_usage([i for i in entry_ids if i not in ("SESSION", "UPDATES")
+                                  and not str(i).startswith("HISTORY:")], self.project_id)
         except Exception:
             log.exception("usage recording failed")
 
@@ -129,10 +178,18 @@ class Orchestrator:
         from .triggers import _RULES
         if not _RULES["correction"].search(user_message or ""):
             return None
-        suggested = sorted(identifiers(user_message) - identifiers(prev_answer) - identifiers(prev_question))
+        import re as _re
+        # "no, it's 11435, not 11434": what the user negates is what the answer must NOT say.
+        negated = set()
+        for m in _re.finditer(r"\b(?:not|isn['’]?t|wasn['’]?t|instead of|rather than|não|nao|em vez de)\s+"
+                              r"((?:the\s+|a\s+|o\s+|a\s+)?\S+)", user_message, _re.I):
+            negated |= identifiers(m.group(1))
+        new = identifiers(user_message) - identifiers(prev_answer) - identifiers(prev_question)
+        suggested = sorted(new - negated)
+        forbid = sorted(negated & identifiers(prev_answer)) or sorted(negated)
         try:
             cid = self.db.add_candidate(conversation_id, turn, prev_question[:4000], prev_answer[:4000],
-                                        user_message[:2000], suggested[:5])
+                                        user_message[:2000], suggested[:5], [f"/\\b{_re.escape(x)}\\b/" for x in forbid[:5]])
             log.info("golden candidate captured", extra={"conversation_id": conversation_id,
                                                          "detail": f"#{cid} turn {turn}"})
             return cid
@@ -188,9 +245,13 @@ class Orchestrator:
         summary = self.session_summary(conversation_id)
         base = self.memory_base(conversation_id, ("chat", turn_number // self.config.stable_memory.refresh_turns))
         budget = self.config.memory.max_context_tokens - (base.tokens if base else 0)
+        qvec = await self.query_vector(message)
+        history = self.recall_history(message, qvec, conversation_id,
+                                      max(0, turn_number - 1 - self.config.conversation.recent_turns))
         # /chat never resends full history, so the summary is always useful once it exists.
         ctx = self.context_builder.build(message, max_tokens=budget, base=base, preamble=False,
-                                         session_summary=summary["summary"] if summary else None)
+                                         session_summary=summary["summary"] if summary else None,
+                                         query_vec=qvec, history=history)
         messages = [{"role": "system", "content": self.system_prompt(base)}]
         self.record_usage(list(ctx.included) + list(base.fingerprints if base else ()))
         recent = self._recent.setdefault(conversation_id, deque(maxlen=max(1, self.config.conversation.recent_turns) * 2))
@@ -241,4 +302,6 @@ class Orchestrator:
         return {"conversation_id": conversation_id, "response": answer, "memory_update_queued": queued,
                 "request_id": request_id,
                 "memory_entries_used": sorted(set(ctx.included) | set(base.fingerprints if base else ())),
-                "memory_flags": flags, "turn": turn_number}
+                "memory_flags": flags, "turn": turn_number,
+                "thinking": rec.get("thinking"), "thinking_reason": rec.get("thinking_reason"),
+                "seconds": rec.get("total_request_time")}

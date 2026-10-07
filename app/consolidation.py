@@ -343,6 +343,8 @@ class Consolidator:
         except Exception as e:  # the memory GPU being down must not crash the worker
             report.error = f"{type(e).__name__}: {e}"
             log.warning("consolidation stopped", extra={"detail": report.error})
+        if report.applied and not dry_run and getattr(orch, "indexer", None) is not None:
+            orch.queue_embed()
         if not dry_run and not report.interrupted and not report.error:
             orch.db.kv_set("consolidation.last_run_ts", str(time.time()))
             orch.db.kv_set("consolidation.last_change_id", str(max(start_change_id, orch.db.max_change_id())))

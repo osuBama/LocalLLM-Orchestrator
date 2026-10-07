@@ -145,10 +145,12 @@ foreach ($port in $ports) {
 }
 
 $instances = @(
-    @{ Role = "primary"; Port = $PrimaryPort; Gpu = $pGpu; Ctx = $PrimaryContext; Max = $(if ($SingleGpu) { "2" } else { "1" }) }
+    # Single GPU: primary + memory + embedding model on one instance.
+    @{ Role = "primary"; Port = $PrimaryPort; Gpu = $pGpu; Ctx = $PrimaryContext; Max = $(if ($SingleGpu) { "3" } else { "1" }) }
 )
 if (-not $SingleGpu) {
-    $instances += @{ Role = "memory"; Port = $MemoryPort; Gpu = $mGpu; Ctx = $MemoryContext; Max = "1" }
+    # Memory model + embedding model: 2, so embedding calls never evict the memory model.
+    $instances += @{ Role = "memory"; Port = $MemoryPort; Gpu = $mGpu; Ctx = $MemoryContext; Max = "2" }
 }
 $vars = "OLLAMA_HOST","CUDA_VISIBLE_DEVICES","OLLAMA_MODELS","OLLAMA_FLASH_ATTENTION",
         "OLLAMA_KV_CACHE_TYPE","OLLAMA_NUM_PARALLEL","OLLAMA_MAX_LOADED_MODELS",

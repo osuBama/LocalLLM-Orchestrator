@@ -135,3 +135,38 @@ def test_cli_sessions_and_nothing_to_do(cfg, tmp_path, capsys, monkeypatch):
     assert cli.main(["--config", str(p), "eval", "sessions"]) == 0
     assert "s1" in capsys.readouterr().out
     assert cli.main(["--config", str(p), "eval", "run", "--min-turns", "10"]) == 2
+
+
+def test_wilson_interval():
+    assert ev.wilson(0, 0) is None
+    lo, hi = ev.wilson(5, 5)
+    assert hi == 1.0 and 0.5 < lo < 0.6          # 5/5 is not proof of 100%
+    lo2, hi2 = ev.wilson(50, 50)
+    assert lo2 > lo                               # more samples, tighter interval
+
+
+def test_repeats_replay_once_and_count(cfg, fakes):
+    primary, memory = fakes
+    primary.reply = "The memory instance uses port 11435."
+    cases = ev.load_golden("examples/golden.example.yaml")[:1]
+    rep = run(cfg, fakes, sessions=[], golden=cases, variant_names=["full"], repeats=3)
+    gs = [g for g in rep["golden"] if g["variant"] == "full"]
+    assert len(gs) == 3 and rep["variants"]["full"]["golden_total"] == 3
+    asks = [r for r in primary.requests if r.get("options", {}).get("num_predict", 0) > 1]
+    assert sorted(r["options"]["seed"] for r in asks) == [42, 43, 44]
+    assert all(r["options"]["temperature"] == 0.7 for r in asks)
+    md = open(rep["files"]["markdown"], encoding="utf-8").read()
+    assert "3/3" in md and "95% interval" in md
+
+
+def test_regression_flagged_against_previous_run(cfg, fakes):
+    primary, memory = fakes
+    cases = ev.load_golden("examples/golden.example.yaml")[:1]
+    primary.reply = "port 11435"
+    first = run(cfg, fakes, sessions=[], golden=cases, variant_names=["full"], repeats=6)
+    assert first["regressions"]["previous"] is None
+    import time
+    time.sleep(1.1)                               # distinct report timestamp
+    primary.reply = "no idea"
+    second = run(cfg, fakes, sessions=[], golden=cases, variant_names=["full"], repeats=6)
+    assert second["regressions"]["previous"] and "pass rate fell" in second["regressions"]["flags"][0]

@@ -57,6 +57,18 @@ def create_app(config: Config | None = None, *,
     app = FastAPI(title="Local AI Orchestrator", version=__version__, lifespan=lifespan)
     app.state.orch = orch
 
+    from fastapi.responses import JSONResponse as _JSON
+    from .ui import build_ui_router, csrf_guard_paths
+
+    @app.middleware("http")
+    async def csrf_guard(request, call_next):
+        # Admin endpoints must not be triggerable by a web page open in your browser.
+        if request.method in ("POST", "PUT", "PATCH", "DELETE") and csrf_guard_paths(request.url.path) \
+                and not request.headers.get("x-ai-client"):
+            return _JSON({"error": "missing X-AI-Client header (required for admin requests; "
+                                   "e.g. curl -H 'X-AI-Client: 1')"}, status_code=403)
+        return await call_next(request)
+
     # ------------------------------------------------------------ spec API
     @app.post("/chat")
     async def chat(req: ChatRequest):
@@ -74,10 +86,19 @@ def create_app(config: Config | None = None, *,
             warnings.append("primary and memory use the same Ollama endpoint: no GPU isolation")
         files = orch.manager.validate_files()
         bad = [f for f in files if not f["ok"]]
+        emb = None
+        if orch.indexer is not None:
+            emb = {"model": orch.embedder.model,
+                   "memory_vectors": orch.indexer.index.count("memory"),
+                   "history_vectors": orch.indexer.index.count("history"),
+                   "query_ok": (await orch.query_vector("health check")) is not None}
+            if not emb["query_ok"]:
+                warnings.append(f"embedding model {orch.embedder.model} unavailable: keyword search only")
         status = "ok" if primary.get("reachable") and not bad else "degraded"
         return {"status": status, "version": __version__, "primary": primary, "memory": memory,
                 "worker_running": orch.worker._task is not None and not orch.worker._task.done(),
                 "memory_tasks": orch.db.task_counts(),
+                "embeddings": emb,
                 "memory_files_ok": not bad, "memory_file_errors": bad, "warnings": warnings}
 
     @app.get("/memory/state")
@@ -90,7 +111,8 @@ def create_app(config: Config | None = None, *,
     @app.get("/memory/search")
     async def memory_search(q: str = Query(..., min_length=1), limit: int = Query(10, ge=1, le=50),
                             include_inactive: bool = False):
-        hits = orch.retriever.search(q, limit, include_inactive=include_inactive)
+        hits = orch.retriever.search(q, limit, include_inactive=include_inactive,
+                                     query_vec=await orch.query_vector(q))
         return {"query": q, "results": [{"score": h.score, "entry_id": h.entry.entry_id,
                                          "category": h.entry.category.value, "title": h.entry.title,
                                          "content": h.entry.content, "active": h.entry.active}
@@ -101,7 +123,11 @@ def create_app(config: Config | None = None, *,
         """Debug: exactly what would be injected for this prompt."""
         base = orch.memory_base("__debug__", ("debug", q))
         budget = config.memory.max_context_tokens - (base.tokens if base else 0)
-        ctx = orch.context_builder.build(q, max_tokens=budget, base=base)
+        qvec = await orch.query_vector(q)
+        # Same shape as a real request: no preamble when the (cached) system prompt carries it.
+        ctx = orch.context_builder.build(q, max_tokens=budget, base=base, query_vec=qvec,
+                                         history=orch.recall_history(q, qvec, "__debug__", 0),
+                                         preamble=not config.proxy.append_system_prompt)
         return {"budget": config.memory.max_context_tokens,
                 "base": {"token_estimate": base.tokens if base else 0,
                          "included": list(base.fingerprints) if base else [],
@@ -159,6 +185,8 @@ def create_app(config: Config | None = None, *,
         snap["tool_digests"] = orch.db.digest_stats()
         snap["token_calibration"] = orch.calibrator.snapshot()
         return snap
+
+    app.include_router(build_ui_router(orch))
 
     # ---------------------------------------------- OpenClaw / Ollama proxy
     app.include_router(build_router(orch))

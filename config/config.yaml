@@ -12,12 +12,12 @@ paths:
   prompts: "prompts"
 
 ollama:
-  # Instance A: the primary GPU (README §2, §4)
+  # Instance A: the primary GPU (docs/DOCUMENTATION.md §2, §4)
   primary:
     base_url: "http://127.0.0.1:11434"
     model: "qwen3:14b"          # default for POST /chat; proxied requests keep their own model
     timeout_seconds: 600
-    num_ctx: 16384              # size to your VRAM (README §2.2); qwen3:14b at 16k fits 12 GB with q8_0 KV
+    num_ctx: 16384              # size to your VRAM (docs/DOCUMENTATION.md §2.2); qwen3:14b at 16k fits 12 GB with q8_0 KV
     keep_alive: "30m"
 
   # Instance B: the memory GPU
@@ -34,7 +34,7 @@ memory:
   max_context_tokens: 2500      # memory budget injected into the primary prompt (~15% of primary num_ctx)
   max_memory_file_tokens: 4000  # `ai memory validate` warns when a file grows past this
   max_entry_tokens: 600         # single entries longer than this are truncated in context
-  enable_semantic_retrieval: false   # Phase 3
+  enable_semantic_retrieval: true    # hybrid keyword + vector search (see embeddings:)
   asynchronous_updates: true
   create_backups: true
   history_versions_per_file: 50
@@ -121,6 +121,26 @@ consolidation:
   max_changes_per_run: 10
   max_cluster_size: 6
   stale_after_days: 30          # `ai memory review` lists active entries never used for this long
+
+embeddings:
+  # Embedding model for semantic memory search and history recall. Runs on the memory instance
+  # (which is allowed 2 loaded models so it never evicts the memory model). If it is slow or down,
+  # retrieval silently falls back to keyword search.
+  enabled: true
+  model: "nomic-embed-text"
+  # base_url: "http://127.0.0.1:11435"   # default: the memory instance
+  timeout_seconds: 3
+  min_similarity: 0.35          # vector-only memory matches below this are ignored
+
+history_recall:
+  # Short verbatim excerpts from OLDER exchanges (other sessions, or turns already trimmed away)
+  # when the prompt clearly relates to them. Labelled with date; marked as possibly outdated.
+  enabled: true
+  max_tokens: 600
+  top_k: 2
+  min_similarity: 0.6
+  cue_min_similarity: 0.45      # lower bar when you say "last time", "earlier", "remember"...
+  chunk_chars: 1500
 
 thinking:
   # Primary-model thinking per turn. auto: thinking is switched OFF only for clearly simple

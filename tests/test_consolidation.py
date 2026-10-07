@@ -169,6 +169,6 @@ def test_restore_from_backup(env):
 def test_api_status_and_last_report(env):
     client, orch, memory = env
     memory.memory_json = MERGE
-    client.post("/memory/consolidate")
+    client.post("/memory/consolidate", headers={"X-AI-Client": "1"})
     st = client.get("/memory/consolidation").json()
     assert st["last_report"]["applied"][0]["kind"] == "merge"

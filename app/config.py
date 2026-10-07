@@ -49,7 +49,7 @@ class MemoryConfig(_Strict):
     max_context_tokens: int = Field(2500, gt=0)
     max_memory_file_tokens: int = 4000
     max_entry_tokens: int = 600
-    enable_semantic_retrieval: bool = False
+    enable_semantic_retrieval: bool = True   # hybrid keyword + vector search (needs embeddings)
     asynchronous_updates: bool = True
     create_backups: bool = True
     history_versions_per_file: int = 50
@@ -152,6 +152,27 @@ class ThinkingConfig(_Strict):
     simple_max_words: int = Field(25, ge=1)
 
 
+class EmbeddingsConfig(_Strict):
+    """Embedding model (on the memory GPU by default) for semantic memory and history recall."""
+    enabled: bool = True
+    model: str = "nomic-embed-text"
+    base_url: str | None = None          # default: ollama.memory.base_url
+    query_prefix: str | None = None      # None = automatic for known models (nomic: "search_query: ")
+    document_prefix: str | None = None
+    timeout_seconds: float = Field(3.0, gt=0)   # query embedding in the request path; falls back to keywords
+    min_similarity: float = Field(0.35, ge=0, le=1)  # vector-only memory hits below this are ignored
+
+
+class HistoryRecallConfig(_Strict):
+    """Inject short verbatim excerpts of older exchanges that are no longer in the prompt."""
+    enabled: bool = True
+    max_tokens: int = Field(600, ge=0)
+    top_k: int = Field(2, ge=1, le=10)
+    min_similarity: float = Field(0.6, ge=0, le=1)
+    cue_min_similarity: float = Field(0.45, ge=0, le=1)  # when the prompt says "last time", "earlier", ...
+    chunk_chars: int = Field(1500, ge=200)
+
+
 class SessionConfig(_Strict):
     summaries_enabled: bool = True
     summary_max_tokens: int = Field(400, ge=50, le=2000)
@@ -175,6 +196,8 @@ class Config(_Strict):
     stable_memory: StableMemoryConfig = StableMemoryConfig()
     consolidation: ConsolidationConfig = ConsolidationConfig()
     thinking: ThinkingConfig = ThinkingConfig()
+    embeddings: EmbeddingsConfig = EmbeddingsConfig()
+    history_recall: HistoryRecallConfig = HistoryRecallConfig()
 
     @model_validator(mode="after")
     def _check_compression(self):

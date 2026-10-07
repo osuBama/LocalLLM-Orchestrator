@@ -25,6 +25,7 @@ def make_config(root: Path, **memory_overrides) -> Config:
                        "timeout_seconds": 5, "think": False},
         },
         memory=mem,
+        embeddings={"enabled": False},   # tests that need vectors turn this on explicitly
         application={"log_level": "WARNING"},
     )
 
@@ -32,6 +33,30 @@ def make_config(root: Path, **memory_overrides) -> Config:
 @pytest.fixture
 def cfg(tmp_path):
     return make_config(tmp_path)
+
+
+_SYNONYMS = {"refused": "connect", "connection": "connect", "connecting": "connect", "reach": "connect",
+             "unreachable": "connect", "porta": "port", "ports": "port", "gpu": "card", "graphics": "card",
+             "vram": "card", "memória": "memory"}
+_PREFIXES = ("search_query: ", "search_document: ")
+
+
+def fake_embedding(text: str, dim: int = 128) -> list[float]:
+    """Deterministic bag-of-words embedding with a tiny synonym table (paraphrase-aware enough for tests)."""
+    import hashlib
+    import re
+    for p in _PREFIXES:
+        if text.startswith(p):
+            text = text[len(p):]
+    v = [0.0] * dim
+    for w in re.findall(r"[a-zà-ú0-9]+", text.lower()):
+        if len(w) < 3:
+            continue
+        w = _SYNONYMS.get(w, w)
+        h = int(hashlib.md5(w.encode()).hexdigest(), 16)
+        v[h % dim] += 1.0
+    n = sum(x * x for x in v) ** 0.5 or 1.0
+    return [x / n for x in v]
 
 
 class FakeOllama:
@@ -107,6 +132,21 @@ class FakeOllama:
             vram = size if ctx <= limit else int(size * 0.8)
             self.ps_models[name] = {"name": name, "size": size, "size_vram": vram, "context_length": ctx}
             return {"model": name, "done": True, "response": ""}
+
+        self.embed_calls = 0
+        self.embed_fail = False
+
+        @app.post("/api/embed")
+        async def embed(request: Request):
+            body = await request.json()
+            self.embed_calls += 1
+            if self.embed_fail:
+                return JSONResponse({"error": "embed model not loaded"}, status_code=500)
+            texts = body["input"] if isinstance(body["input"], list) else [body["input"]]
+            if body.get("keep_alive") and self.ps_models is not None and body["model"] not in self.ps_models \
+                    and self.vram_fits_at:
+                self.ps_models[body["model"]] = {"name": body["model"], "size": 300, "size_vram": 300}
+            return {"model": body["model"], "embeddings": [fake_embedding(t) for t in texts]}
 
         @app.get("/api/tags")
         async def tags():

@@ -28,6 +28,8 @@ PRIORITY: list[tuple[Category, bool]] = [
 ]
 
 SESSION_LABEL = "SESSION SO FAR (summary of earlier turns no longer shown verbatim)"
+HISTORY_LABEL = ("RELATED PAST EXCHANGES (verbatim excerpts from earlier conversations; may be outdated, "
+                 "current evidence wins)")
 
 RENDER_ORDER: list[tuple[Category, str]] = [
     (Category.state, "CURRENT STATE"),
@@ -157,7 +159,7 @@ class ContextBuilder:
     # -------------------------------------------------------- per-turn block
     def build(self, query: str, max_tokens: int | None = None,
               session_summary: str | None = None, base: StableSnapshot | None = None,
-              preamble: bool = True) -> BuiltContext:
+              preamble: bool = True, query_vec=None, history: list[dict] | None = None) -> BuiltContext:
         """Per-turn memory block for the latest user message.
 
         With `base`, entries already in the frozen base are skipped, and entries in
@@ -222,7 +224,8 @@ class ContextBuilder:
                 candidates.sort(key=lambda e: e.updated_at or "", reverse=True)
             else:
                 candidates = [s.entry for s in
-                              self.retriever.search(query, self.relevant_limit, categories=[cat])]
+                              self.retriever.search(query, self.relevant_limit, categories=[cat],
+                                                    query_vec=query_vec)]
             for e in candidates:
                 if e.entry_id in skip:
                     continue
@@ -235,6 +238,24 @@ class ContextBuilder:
                 else:
                     dropped.append(e.entry_id)
 
+        history_text = ""
+        if history:
+            label = f"\n{HISTORY_LABEL}:\n"
+            lines = []
+            cost_total = estimate_tokens(label)
+            for h in history:
+                line = sanitize_memory_text(f"- [{h['date']}, conversation {h['conversation_id']}, turn {h['turn']}]\n"
+                                            + "\n".join("  " + x for x in h["text"].splitlines()))
+                cost = estimate_tokens(line + "\n")
+                if cost_total + cost > remaining:
+                    break
+                lines.append(line)
+                cost_total += cost
+            if lines:
+                history_text = label + "\n".join(lines) + "\n"
+                remaining -= cost_total
+                included.extend(f"HISTORY:{h['key']}" for h in history[:len(lines)])
+
         if not included:
             return BuiltContext("", 0, [], dropped)
 
@@ -243,6 +264,8 @@ class ContextBuilder:
             parts.append(updates_text)
         if session_text:
             parts.append(session_text)
+        if history_text:
+            parts.append(history_text)
         for cat, label in RENDER_ORDER:
             if chosen[cat]:
                 parts.append(f"\n{label}:\n" + "\n".join(chosen[cat]) + "\n")
